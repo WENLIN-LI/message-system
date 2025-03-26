@@ -1,4 +1,4 @@
-# 消息系统 (Message System)
+# Message System
 
 [English Version](./README.md)
 

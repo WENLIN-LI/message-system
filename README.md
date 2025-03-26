@@ -1,5 +1,3 @@
-## 🔄 English Version
-
 # Message System
 
 [中文版](./README.zh.md)
