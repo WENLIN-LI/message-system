@@ -221,7 +221,7 @@
   - 切换 PostgreSQL 模式：部署环境设置 `PERSISTENCE_STORE=postgres`、`DATABASE_URL=...`，需要 TLS 时设置 `POSTGRES_SSL=true`。
   - 可选缓存 TTL：`ROOM_MESSAGES_CACHE_TTL_SECONDS`，默认 30 秒；小于等于 0 时禁用 room message cache 写入。
 - 阶段 6：已完成。
-  - README / README.zh 已更新 PostgreSQL 持久化模式、迁移命令、回滚说明和当前默认模型配置。
+  - README 已更新 PostgreSQL 持久化模式、迁移命令、回滚说明和当前默认模型配置。
   - DeploymentGuide / 部署指南 已增加 PostgreSQL 上线流程和环境变量。
   - `server/.env.example` 已补齐 PostgreSQL、TLS 和缓存 TTL 配置。
   - 新增 PostgreSQL rollout runbook，覆盖 dry-run、迁移、切换、验证、回滚和清理窗口。

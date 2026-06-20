@@ -11,8 +11,7 @@ excluded.
 
 | Document | Status | Notes |
 | --- | --- | --- |
-| `README.md` | Rewritten | Current product, architecture, commands, config, persistence, media, deployment, testing, and doc map. |
-| `README.zh.md` | Rewritten | Chinese mirror of the current README. |
+| `README.md` | Rewritten | Current product, architecture, commands, config, persistence, media, deployment, testing, and doc map. English-only root entry point. |
 | `CLAUDE.md` | Active | Agent/developer guide. `AGENTS.md` is a symlink to this file. |
 | `DeploymentGuide.md` | Active runbook | Updated to CI-first deployment, existing Dockerfile, current secrets, and non-static pricing guidance. |
 | `部署指南.md` | Active runbook | Chinese deployment guide with the same current constraints. |

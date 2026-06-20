@@ -1,77 +1,83 @@
-# RoomTalk
+# Message System
 
-[中文版](./README.zh.md)
+Real-time room chat with AI assistants, private media sharing, stickers, saved rooms, room administration, mobile recovery, and optional PostgreSQL persistence.
 
-RoomTalk is a real-time room chat system with AI assistants, private media, stickers, room management, saved rooms, mobile recovery, and optional PostgreSQL durable storage. The repository contains a React/Vite client and a Node/Express/Socket.IO server.
+Repository: [github.com/WENLIN-LI/message-system](https://github.com/WENLIN-LI/message-system)
 
-## Current Capabilities
+## What Is Included
 
-- Room creation, joining by ID/link, saved rooms, room rename/delete, member roles, admin controls, ownership transfer, password rooms, and posting schedules.
-- Text, AI, media, sticker, reply, edit, delete, and clear-history message flows.
-- AI streaming with provider-aware clients for DeepSeek, Anthropic, OpenAI, and OpenRouter-routed models.
-- AI role presets, model selection, premium model confirmation, usage/cost metadata, retry/edit-and-ask flows, and A2UI streaming surfaces.
-- Private media upload/download via S3-compatible storage, local media fallback in development, media history, image/video/audio handling, and mobile media-viewer gestures.
-- Voice transcription via AssemblyAI when configured.
-- Google sign-in linking, client password protection, token-based socket registration, and optional web-push notifications.
-- i18n for English, Chinese, Hindi, Japanese, and Korean.
-- Mobile-focused reliability: active-room restore, reconnect handling, member-count recovery, keyboard viewport fixes, and mobile E2E coverage.
+- React 18 + Vite client in `client-heroui/`.
+- Node.js 22 + Express + Socket.IO server in `server/`.
+- Redis-backed realtime presence, Socket.IO scaling, and default durable storage.
+- Optional PostgreSQL durable store with Redis kept for realtime state and message caching.
+- Private media uploads through S3-compatible storage in production, with local media object routes for development.
+- AI streaming through DeepSeek, Anthropic, OpenAI/OpenRouter-compatible models, plus AI role draft generation.
+- Audio transcription through AssemblyAI when configured.
+- Google sign-in linking, client password protection, room passwords, admin/member controls, and optional web push notifications.
+- Five UI languages: English, Chinese, Hindi, Japanese, and Korean.
+- Unit/component tests, Socket.IO/repository/API tests, and Playwright E2E coverage.
 
 ## Repository Layout
 
 ```text
 client-heroui/     React + TypeScript + Vite frontend
 server/            Express + Socket.IO TypeScript backend
-docs/              Runbooks, design records, migration notes, reliability writeups
-Dockerfile         Production image build used by Fly.io
-fly.toml           Fly.io app configuration
-start.sh           Local convenience launcher: server on 3012, client on 3011
-CLAUDE.md          Agent/developer guide; AGENTS.md symlinks to it
+docs/              Runbooks, design records, migration notes, reliability notes
+Dockerfile         Production image: builds client and server, serves client from Express
+fly.toml           Fly.io app configuration for the message-system app
+start.sh           Local launcher: server on 3012, client on 3011
+CLAUDE.md          Developer/agent guide; AGENTS.md points to it
 ```
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-  Client["React client"] <--> Socket["Socket.IO server"]
-  Client --> HTTP["Express API"]
+  Browser["Browser client"] <--> Socket["Socket.IO server"]
+  Browser --> API["Express API"]
   Socket --> Store["CompositeRoomStore"]
-  HTTP --> Store
-  Store --> Durable["Redis or PostgreSQL durable store"]
-  Store --> Redis["Redis realtime state + Socket.IO adapter + cache"]
+  API --> Store
+  Store --> Durable["Redis or PostgreSQL durable data"]
+  Store --> Realtime["Redis realtime state + adapter + cache"]
   Socket --> AI["AI providers"]
-  HTTP --> Media["S3/Tigris or local media storage"]
+  API --> Media["S3-compatible or local media storage"]
+  API --> Auth["Google auth + client tokens"]
+  API --> Push["Web push"]
 ```
 
-The server uses a `CompositeRoomStore`:
+The server chooses its durable store with `PERSISTENCE_STORE`:
 
-- Durable store: Redis by default, or PostgreSQL with `PERSISTENCE_STORE=postgres`.
-- Realtime store: Redis for socket sessions, online membership, and Socket.IO adapter state.
-- Message cache: Redis TTL cache in front of PostgreSQL message reads.
+- `redis`: Redis stores rooms, messages, members, auth, media metadata, and realtime state.
+- `postgres`: PostgreSQL stores durable records, while Redis still handles online presence, socket sessions, Socket.IO pub/sub, and the optional room-message cache.
 
-Client state is centered in `MessagePage`, with reusable UI in `src/components`, socket/API wrappers in `src/utils`, and room/message sync logic in `src/hooks`.
+The React app is a single-page app centered on `MessagePage`. UI is organized under `src/components`, stateful behavior under `src/hooks`, and socket/API/persistence helpers under `src/utils`.
+
+## Requirements
+
+- Node.js 22.
+- Redis at `redis://localhost:6379` for local development.
+- Optional PostgreSQL database for PostgreSQL persistence tests and smoke tests.
+- Optional provider accounts for AI, media storage, Google sign-in, AssemblyAI, and web push.
 
 ## Quick Start
-
-Requirements:
-
-- Node.js 22 recommended.
-- Redis running locally at `localhost:6379`.
-- Optional: PostgreSQL test database for PostgreSQL-mode smoke/E2E.
 
 Install dependencies:
 
 ```bash
-cd server && npm install
-cd ../client-heroui && npm install
+cd server
+npm install
+
+cd ../client-heroui
+npm install
 ```
 
-Create local server config:
+Create backend config:
 
 ```bash
 cp server/.env.example server/.env
 ```
 
-For AI with the default model, set `DEEPSEEK_API_KEY`. For OpenRouter-routed models and AI role draft generation, set `OPENROUTER_API_KEY`.
+For a minimal local chat setup, leave Redis enabled and start a local Redis server. For AI responses, add at least one provider key such as `DEEPSEEK_API_KEY` or `OPENROUTER_API_KEY`.
 
 Start both apps:
 
@@ -79,13 +85,17 @@ Start both apps:
 ./start.sh
 ```
 
+The launcher builds the server, starts the compiled server on `http://localhost:3012`, and starts Vite on `http://localhost:3011`.
+
 Manual development mode:
 
 ```bash
 cd server
 npm run dev
+```
 
-cd ../client-heroui
+```bash
+cd client-heroui
 npm run dev
 ```
 
@@ -97,12 +107,12 @@ Server:
 
 ```bash
 cd server
-npm run dev                         # ts-node-dev server
-npm run build                       # TypeScript build
+npm run dev                         # ts-node-dev hot reload
+npm run build                       # TypeScript build to dist/
 npm start                           # run dist/src/server.js
-npm test                            # Node test runner over src/**/*.test.ts
-npm run migrate:redis-to-postgres   # Redis -> PostgreSQL durable migration
-npm run smoke:persistence           # safe local persistence smoke test
+npm test                            # Node built-in test runner over src/**/*.test.ts
+npm run migrate:redis-to-postgres   # Redis -> PostgreSQL migration
+npm run smoke:persistence           # guarded local persistence smoke test
 ```
 
 Client:
@@ -113,36 +123,58 @@ npm run dev                 # Vite dev server
 npm test                    # Vitest unit/component tests
 npm run lint                # ESLint
 npm run check:i18n          # verify translation keys
+npm run translate:i18n:dry  # preview generated translation updates
+npm run translate:i18n      # apply generated translation updates
 npm run build               # i18n check + TypeScript + Vite build
-npm run test:e2e            # Playwright E2E against Redis mode
+npm run test:e2e            # Playwright E2E
 npm run test:e2e:postgres   # Playwright E2E against PostgreSQL mode
+npm run preview             # preview built client
 ```
 
 ## Configuration
 
-Use `server/.env.example` as the backend source of truth. Important groups:
+Start from `server/.env.example`, then add optional service variables as needed.
 
 | Area | Variables |
 | --- | --- |
 | HTTP/CORS | `PORT`, `CLIENT_URL`, `NODE_ENV` |
 | Redis | `REDIS_URL` |
-| PostgreSQL mode | `PERSISTENCE_STORE`, `DATABASE_URL`, `POSTGRES_SSL`, `POSTGRES_SSL_REJECT_UNAUTHORIZED`, `POSTGRES_SSL_CA_BASE64`, `POSTGRES_SSL_CA`, `ROOM_MESSAGES_CACHE_TTL_SECONDS` |
+| Persistence | `PERSISTENCE_STORE`, `DATABASE_URL`, `POSTGRES_SSL`, `POSTGRES_SSL_REJECT_UNAUTHORIZED`, `POSTGRES_SSL_CA_BASE64`, `POSTGRES_SSL_CA`, `ROOM_MESSAGES_CACHE_TTL_SECONDS` |
 | AI | `AI_MODEL`, `AI_MODEL_OPTIONS`, `DEEPSEEK_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `OPENROUTER_BASE_URL`, `OPENROUTER_HTTP_REFERER`, `OPENROUTER_APP_NAME` |
-| Media storage | `MEDIA_BUCKET_NAME`, `MEDIA_STORAGE_REGION`, `MEDIA_STORAGE_ENDPOINT`, `MEDIA_STORAGE_FORCE_PATH_STYLE`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` |
+| Media storage | `MEDIA_BUCKET_NAME`, `MEDIA_STORAGE_REGION`, `MEDIA_STORAGE_ENDPOINT`, `MEDIA_STORAGE_FORCE_PATH_STYLE`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `LOCAL_MEDIA_DIR` |
 | Optional services | `ASSEMBLYAI_API_KEY`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_IDS`, `WEB_PUSH_VAPID_PUBLIC_KEY`, `WEB_PUSH_VAPID_PRIVATE_KEY`, `WEB_PUSH_SUBJECT` |
 
-Client configuration:
+Client environment files:
 
-- `client-heroui/.env.development`: local `VITE_SOCKET_URL` and public Google client ID.
-- `client-heroui/.env.production`: same-origin `VITE_SOCKET_URL=/` for Fly deployment.
+- `client-heroui/.env.development` points the browser to the local server with `VITE_SOCKET_URL=http://localhost:3012`.
+- `client-heroui/.env.production` uses same-origin routing with `VITE_SOCKET_URL=/`.
 
-Only put browser-safe values in `VITE_*` variables.
+Only browser-safe values should use the `VITE_*` prefix.
 
-## Persistence And Migrations
+## AI Models
 
-Redis remains the default local durable store. PostgreSQL mode makes PostgreSQL the durable source of truth while Redis still handles realtime state, Socket.IO scaling, and short TTL message cache.
+The default AI model is `deepseek-v4-pro`. The built-in catalog includes DeepSeek, Claude, GPT, Kimi, GLM, MiniMax, Grok, Tencent, and Gemini options. `AI_MODEL_OPTIONS` controls which model IDs are exposed, and unknown configured models are treated as OpenRouter model IDs.
 
-Redis to PostgreSQL cutover:
+Premium models require confirmation in the client when pricing metadata marks them as expensive or unknown.
+
+## Persistence
+
+Redis is the default local durable store:
+
+```env
+PERSISTENCE_STORE=redis
+REDIS_URL=redis://localhost:6379
+```
+
+PostgreSQL mode:
+
+```env
+PERSISTENCE_STORE=postgres
+DATABASE_URL=postgres://user:password@localhost:5432/message_system
+REDIS_URL=redis://localhost:6379
+```
+
+Redis-to-PostgreSQL migration:
 
 ```bash
 cd server
@@ -150,23 +182,7 @@ REDIS_URL="redis://..." npm run migrate:redis-to-postgres -- --dry-run
 REDIS_URL="redis://..." DATABASE_URL="postgres://..." npm run migrate:redis-to-postgres
 ```
 
-Run the final migration during a write freeze or maintenance window, then set:
-
-```bash
-fly secrets set PERSISTENCE_STORE="postgres"
-fly secrets set DATABASE_URL="postgres://..."
-fly secrets set POSTGRES_SSL="true"
-```
-
-Rollback is configuration-only while Redis durable data is retained:
-
-```bash
-fly secrets set PERSISTENCE_STORE="redis"
-```
-
-Full checklist: [docs/postgres-rollout-runbook.md](docs/postgres-rollout-runbook.md).
-
-Persistence smoke tests are intentionally guarded:
+Persistence smoke tests are guarded so they do not accidentally run against production data:
 
 ```bash
 cd server
@@ -174,48 +190,45 @@ npm run smoke:persistence
 TEST_DATABASE_URL="postgres://localhost/message_system_test" npm run smoke:persistence
 ```
 
-The PostgreSQL smoke database name must include `test` or `e2e` as a separated token.
+PostgreSQL smoke database names must include `test` or `e2e` as a separated token.
 
 ## Media Storage
 
-New media uploads use private S3-compatible object storage via `MEDIA_*` and AWS credential variables. Development can use local object routes when storage is not configured.
+Production media uses private S3-compatible object storage configured with `MEDIA_*` and AWS credential variables. Fly/Tigris is the current production target.
 
-Known maintenance note: older docs referenced a legacy base64-to-object-storage migration script, but the current checkout does not contain `server/src/scripts/migrateLegacyMediaMessagesToObjectStorage.ts`. Do not run old `dist/...migrateImageMessagesToObjectStorage.js` commands unless the script is restored or reimplemented. See [docs/image-object-storage-migration-runbook.md](docs/image-object-storage-migration-runbook.md).
+When S3-compatible storage is not configured, development can use local media object routes backed by `LOCAL_MEDIA_DIR`.
+
+The legacy base64-to-object-storage migration is intentionally disabled in this checkout. `npm run migrate:media-to-object-storage` exits with a message until `server/src/scripts/migrateLegacyMediaMessagesToObjectStorage.ts` is restored or reimplemented.
 
 ## Deployment
 
-Production deployment is CI-first:
+Deployment is CI-first:
 
 - Pushes to `master` trigger `.github/workflows/fly-deploy.yml`.
-- CI installs dependencies, builds server/client, checks translations, verifies required Fly secrets, then deploys with `flyctl deploy --remote-only`.
-- The Fly app is `message-system` in `dfw`, with a Node 22 Alpine Docker image and a 512 MB VM.
+- CI installs dependencies, builds server and client, runs translation validation, verifies required Fly secrets, and deploys with `flyctl deploy --remote-only -a message-system`.
+- The Docker image builds the Vite client, builds the TypeScript server, then serves the compiled client from Express.
+- Production app: `message-system` on Fly.io in `dfw`.
 
-Required production services normally include Redis, PostgreSQL, S3/Tigris-compatible media storage, AI provider keys, and Google OAuth. Optional services include AssemblyAI and web-push VAPID keys.
+Required Fly secrets include AI provider keys, S3/Tigris credentials, media bucket/endpoint values, and `GOOGLE_CLIENT_ID`. See [DeploymentGuide.md](DeploymentGuide.md) for the full runbook.
 
-Deployment guide: [DeploymentGuide.md](DeploymentGuide.md). Chinese guide: [部署指南.md](部署指南.md).
+## Testing
 
-## Testing Coverage
+The repository has four main test layers:
 
-The test suite includes:
-
-- Server unit/socket/repository/API tests with Node's built-in runner.
+- Server repository, route, service, and socket tests with Node's built-in test runner.
 - Client component and utility tests with Vitest and Testing Library.
-- Playwright E2E for room flows, message flows, AI/media/sharing, mobile core paths, room restore, multi-client realtime, and PostgreSQL persistence.
-- i18n key checks in the client build.
+- Playwright E2E for room flows, message flows, AI/media sharing, mobile behavior, room restore, realtime behavior, and PostgreSQL persistence.
+- i18n key checks as part of the client build.
 
-Use focused tests next to changed code. Use Playwright for browser-visible behavior and PostgreSQL E2E for persistence-mode regressions.
+Use focused tests near changed code. Use Playwright for browser-visible behavior and PostgreSQL E2E for persistence-mode regressions.
 
-## Documentation Map
+## Documentation
 
-- [CLAUDE.md](CLAUDE.md): concise contributor/agent operating guide.
-- [docs/postgres-rollout-runbook.md](docs/postgres-rollout-runbook.md): production PostgreSQL cutover checklist.
-- [docs/postgres-migration-development-summary.zh.md](docs/postgres-migration-development-summary.zh.md): historical PostgreSQL migration review.
-- [docs/room-reliability/README.zh.md](docs/room-reliability/README.zh.md): room restore and room-update reliability series.
-- [docs/media-viewer-gesture-requirements.md](docs/media-viewer-gesture-requirements.md): active media-viewer gesture requirements.
-- [docs/mobile-keyboard-viewport-fix.zh.md](docs/mobile-keyboard-viewport-fix.zh.md): iOS keyboard viewport fix record.
+- [CLAUDE.md](CLAUDE.md): developer and agent operating guide.
+- [DeploymentGuide.md](DeploymentGuide.md): production deployment runbook.
+- [docs/postgres-rollout-runbook.md](docs/postgres-rollout-runbook.md): PostgreSQL cutover checklist.
+- [docs/image-object-storage-migration-runbook.md](docs/image-object-storage-migration-runbook.md): media storage migration notes.
+- [docs/media-viewer-gesture-requirements.md](docs/media-viewer-gesture-requirements.md): media viewer gesture requirements.
+- [docs/documentation-audit.md](docs/documentation-audit.md): documentation status map.
 
-Some files in `docs/` are historical plans or postmortems. Treat runbooks and this README as the active operational entry points.
-
-## License
-
-MIT.
+Some files in `docs/` are historical plans or implementation records. Treat this README, `CLAUDE.md`, and active runbooks as the primary entry points.
