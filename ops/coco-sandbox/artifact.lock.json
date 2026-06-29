@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "artifactName": "message-system-coco",
-  "artifactVersion": "message-system-coco-2026-06-28-a4e70e6",
+  "artifactVersion": "message-system-coco-2026-06-29-prior-messages",
   "pythonVersion": "3.12",
   "baseImage": {
     "name": "python",
@@ -16,7 +16,7 @@
   },
   "runner": {
     "packageName": "message-system-coco-runner",
-    "packageVersion": "0.1.0",
+    "packageVersion": "0.1.1",
     "sourcePath": "server/message-system_coco_runner",
     "command": "python -m message-system_coco_runner"
   },
