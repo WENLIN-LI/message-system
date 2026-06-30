@@ -97,8 +97,13 @@ vi.mock('./MessageInputAIControls', () => ({
       settings
     </button>
   ),
-  MessageInputAIControls: ({ onAskAI, onSend }: any) => (
-    <div>
+  MessageInputAIControls: ({ onAskAI, onSend, isCodeAgentRoom, codeAgentMode, codeAgentMaxMode }: any) => (
+    <div
+      data-testid="message-input-ai-controls"
+      data-code-agent-room={String(Boolean(isCodeAgentRoom))}
+      data-code-agent-mode={codeAgentMode || ''}
+      data-code-agent-max-mode={codeAgentMaxMode || ''}
+    >
       <button type="button" onClick={onAskAI}>ask-ai</button>
       <button type="button" onClick={onSend}>send-message</button>
     </div>
@@ -142,6 +147,26 @@ const renderMessageInput = (props: Partial<ComponentProps<typeof MessageInput>> 
 const setEditorText = (editor: HTMLElement, text: string) => {
   editor.textContent = text;
   fireEvent.input(editor);
+};
+
+const setNavigatorPlatform = (platform: string) => {
+  Object.defineProperty(navigator, 'platform', {
+    configurable: true,
+    value: platform,
+  });
+};
+
+const expectAskAIShortcut = async (content: string) => {
+  await waitFor(() => expect(socketMocks.sendMessageAndAskAI).toHaveBeenCalledTimes(1));
+  expect(socketMocks.sendMessageAndAskAI.mock.calls[0][0]).toMatchObject({
+    roomId: 'room-1',
+    content,
+    systemPrompt: 'You are helpful',
+    roleName: 'Assistant',
+    model: 'model-a',
+  });
+  expect(socketMocks.sendMessage).not.toHaveBeenCalled();
+  expect(socketMocks.requestAIResponse).not.toHaveBeenCalled();
 };
 
 const installVoiceRecordingMocks = () => {
@@ -194,6 +219,7 @@ const installVoiceRecordingMocks = () => {
 describe('MessageInput optimistic send flow', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    setNavigatorPlatform('Win32');
     localStorage.removeItem('roomtalk:ai-context-message-limit');
     socketMocks.requestAIResponse.mockResolvedValue(undefined);
     socketMocks.sendMessage.mockResolvedValue(message());
@@ -312,6 +338,89 @@ describe('MessageInput optimistic send flow', () => {
         savedMessage
       );
     });
+  });
+
+  it('uses Ask AI for Ctrl+Enter on non-macOS platforms', async () => {
+    setNavigatorPlatform('Win32');
+
+    const { editor } = renderMessageInput();
+    setEditorText(editor, 'ask with ctrl shortcut');
+
+    fireEvent.keyDown(editor, { key: 'Enter', ctrlKey: true });
+
+    await expectAskAIShortcut('ask with ctrl shortcut');
+  });
+
+  it.each([
+    ['Command+Enter on non-macOS', 'Win32', { metaKey: true }],
+    ['Alt+Enter', 'MacIntel', { altKey: true }],
+  ])('ignores %s instead of falling back to normal send', (_label, platform, modifiers) => {
+    setNavigatorPlatform(platform);
+
+    const { editor } = renderMessageInput();
+    setEditorText(editor, 'do not send');
+
+    fireEvent.keyDown(editor, { key: 'Enter', ...modifiers });
+
+    expect(socketMocks.sendMessage).not.toHaveBeenCalled();
+    expect(socketMocks.sendMessageAndAskAI).not.toHaveBeenCalled();
+    expect(socketMocks.requestAIResponse).not.toHaveBeenCalled();
+  });
+
+  it('uses Ask AI for Command+Enter on macOS', async () => {
+    setNavigatorPlatform('MacIntel');
+
+    const { editor } = renderMessageInput();
+    setEditorText(editor, 'ask with command shortcut');
+
+    fireEvent.keyDown(editor, { key: 'Enter', metaKey: true });
+
+    await expectAskAIShortcut('ask with command shortcut');
+  });
+
+  it('uses Ask AI for Command+Enter immediately after IME composition ends', async () => {
+    setNavigatorPlatform('MacIntel');
+
+    const { editor } = renderMessageInput();
+    setEditorText(editor, '中文问题');
+
+    fireEvent.compositionStart(editor);
+    fireEvent.compositionEnd(editor);
+    fireEvent.keyDown(editor, { key: 'Enter', metaKey: true });
+
+    await expectAskAIShortcut('中文问题');
+  });
+
+  it('uses code-agent mode without ordinary role prompts for Coco Ask AI', async () => {
+    const savedMessage = message({ id: 'server-message-coco', content: 'write python' });
+    socketMocks.sendMessageAndAskAI.mockResolvedValue({
+      userMessage: savedMessage,
+      aiMessageId: 'coco-ai-message-1',
+      aiStarted: true,
+    });
+
+    const { editor } = renderMessageInput({
+      isCodeAgentRoom: true,
+      codeAgentMode: 'plan',
+      codeAgentMaxMode: 'acceptEdits',
+    });
+    setEditorText(editor, 'write python');
+
+    fireEvent.click(screen.getByText('ask-ai'));
+
+    await waitFor(() => expect(socketMocks.sendMessageAndAskAI).toHaveBeenCalledTimes(1));
+    const payload = socketMocks.sendMessageAndAskAI.mock.calls[0][0];
+
+    expect(screen.getByTestId('message-input-ai-controls').dataset.codeAgentRoom).toBe('true');
+    expect(screen.getByTestId('message-input-ai-controls').dataset.codeAgentMode).toBe('plan');
+    expect(payload).toMatchObject({
+      roomId: 'room-1',
+      content: 'write python',
+      codeAgentMode: 'plan',
+      model: 'model-a',
+    });
+    expect(payload).not.toHaveProperty('systemPrompt');
+    expect(payload).not.toHaveProperty('roleName');
   });
 
   it('confirms the optimistic message when only the AI startup fails', async () => {

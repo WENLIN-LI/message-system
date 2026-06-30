@@ -61,6 +61,32 @@ const deleteRememberedObjectUrl = (cacheName: string, key: string) => {
   URL.revokeObjectURL(objectUrl);
 };
 
+const readBlobAsArrayBuffer = (blob: Blob) => (
+  new Promise<ArrayBuffer>((resolve, reject) => {
+    if (typeof FileReader === "undefined") {
+      reject(new Error("FileReader is unavailable"));
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error || new Error("Failed to read blob"));
+    reader.onload = () => resolve(reader.result as ArrayBuffer);
+    reader.readAsArrayBuffer(blob);
+  })
+);
+
+const getPortableBlobBody = async (blob: Blob): Promise<BodyInit> => {
+  if (typeof blob.arrayBuffer === "function") {
+    return blob.arrayBuffer();
+  }
+
+  try {
+    return await readBlobAsArrayBuffer(blob);
+  } catch {
+    return blob;
+  }
+};
+
 export const shouldCacheMediaBody = (
   kind: CacheableMediaKind,
   byteSize?: number,
@@ -90,6 +116,24 @@ const getBlobObjectUrlFromCache = async (cacheName: string, key: string) => {
   }
 
   return rememberObjectUrl(objectUrlKey, URL.createObjectURL(blob));
+};
+
+export const getCachedMediaObjectUrlFromCache = async (input: {
+  assetId?: string;
+  kind: CacheableMediaKind;
+  byteSize?: number;
+}): Promise<string | null> => {
+  const { assetId, kind, byteSize } = input;
+  if (!assetId || !canUseBrowserCache() || !shouldCacheMediaBody(kind, byteSize)) {
+    return null;
+  }
+
+  try {
+    return await getBlobObjectUrlFromCache(MEDIA_BODY_CACHE_NAME, bodyCacheKey(assetId));
+  } catch (error) {
+    console.warn("Cached media object URL unavailable:", error);
+    return null;
+  }
 };
 
 const trimCache = async (cacheName: string, maxBytes: number) => {
@@ -137,7 +181,7 @@ const putBlobInCache = async (
   headers.set("X-RoomTalk-Byte-Size", String(blob.size));
 
   const cache = await caches.open(cacheName);
-  await cache.put(key, new Response(blob, { headers }));
+  await cache.put(key, new Response(await getPortableBlobBody(blob), { headers }));
   await trimCache(cacheName, maxBytes);
 };
 

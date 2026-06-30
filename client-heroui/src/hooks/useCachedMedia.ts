@@ -1,5 +1,5 @@
 import React from "react";
-import { CacheableMediaKind, getCachedMediaObjectUrl, getCachedVideoPosterUrl } from "../utils/mediaCache";
+import { CacheableMediaKind, getCachedMediaObjectUrl, getCachedMediaObjectUrlFromCache, getCachedVideoPosterUrl } from "../utils/mediaCache";
 
 export const useCachedMedia = (input: {
   assetId?: string;
@@ -7,8 +7,9 @@ export const useCachedMedia = (input: {
   kind?: CacheableMediaKind;
   mimeType?: string;
   byteSize?: number;
+  cacheBodyFetchKey?: number | null;
 }) => {
-  const { assetId, url, kind, mimeType, byteSize } = input;
+  const { assetId, url, kind, mimeType, byteSize, cacheBodyFetchKey } = input;
   const [cachedUrl, setCachedUrl] = React.useState<string | null>(null);
   const [posterUrl, setPosterUrl] = React.useState<string | null>(null);
 
@@ -18,6 +19,31 @@ export const useCachedMedia = (input: {
     setPosterUrl(null);
 
     if (!assetId || !url || !kind) {
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    void (async () => {
+      const mediaObjectUrl = await getCachedMediaObjectUrlFromCache({
+        assetId,
+        kind,
+        byteSize,
+      });
+      if (!cancelled && mediaObjectUrl) {
+        setCachedUrl(mediaObjectUrl);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [assetId, byteSize, kind, url]);
+
+  React.useEffect(() => {
+    let cancelled = false;
+
+    if (!assetId || !url || !kind || cacheBodyFetchKey === null) {
       return () => {
         cancelled = true;
       };
@@ -34,14 +60,26 @@ export const useCachedMedia = (input: {
       if (!cancelled && mediaObjectUrl) {
         setCachedUrl(mediaObjectUrl);
       }
+    })();
 
-      if (kind !== "video") {
-        return;
-      }
+    return () => {
+      cancelled = true;
+    };
+  }, [assetId, byteSize, cacheBodyFetchKey, kind, mimeType, url]);
 
+  React.useEffect(() => {
+    let cancelled = false;
+
+    if (!assetId || !url || kind !== "video" || cacheBodyFetchKey === null) {
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    void (async () => {
       const videoPosterUrl = await getCachedVideoPosterUrl({
         assetId,
-        videoUrl: mediaObjectUrl || url,
+        videoUrl: cachedUrl || url,
       });
       if (!cancelled && videoPosterUrl) {
         setPosterUrl(videoPosterUrl);
@@ -51,7 +89,7 @@ export const useCachedMedia = (input: {
     return () => {
       cancelled = true;
     };
-  }, [assetId, byteSize, kind, mimeType, url]);
+  }, [assetId, cacheBodyFetchKey, cachedUrl, kind, url]);
 
   return {
     mediaUrl: cachedUrl || url,

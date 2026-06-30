@@ -21,10 +21,11 @@ import {
 } from '../services/messageDomain';
 import { notifyRoomMessageBestEffort } from '../services/pushNotifications';
 import { withAIStreamRecoveryMetadata } from '../services/aiStreamRecovery';
+import { CocoRunnerMode } from '../services/cocoRunnerProtocol';
 import { A2UIActionEvent, Message } from '../types';
 import { hasRoomAccess } from './roomAccess';
 import { authorizeRoomAction, getRoomMessage } from './roomAuthorization';
-import { SocketConnectionContext } from './types';
+import { SocketConnectionContext, SocketHandlerDeps } from './types';
 
 // Upper bound on the AI response length (Anthropic). Raised from 8096 to reduce
 // mid-response truncation; only billed for tokens actually generated. Override
@@ -46,6 +47,11 @@ const getE2EFakeAIChunkDelayMs = () => {
 
 const wait = (delayMs: number) => new Promise(resolve => setTimeout(resolve, delayMs));
 
+const isPrematureCloseError = (error: unknown): boolean => {
+  const message = error instanceof Error ? error.message : String(error);
+  return /premature close/i.test(message);
+};
+
 type ReportedUsage = Record<string, any> | null;
 type EmitA2UIUpdate = (messages: unknown[]) => Promise<boolean>;
 
@@ -54,6 +60,21 @@ type StreamAIResult = {
   reportedUsage: ReportedUsage;
   usageMessages: Array<{ content: any }>;
 };
+
+class PartialAIStreamError extends Error {
+  result: StreamAIResult;
+
+  constructor(error: unknown, result: StreamAIResult) {
+    super(error instanceof Error ? error.message : String(error));
+    this.name = 'PartialAIStreamError';
+    this.result = result;
+    (this as any).cause = error;
+  }
+}
+
+const getPartialAIStreamResult = (error: unknown): StreamAIResult | null => (
+  error instanceof PartialAIStreamError ? error.result : null
+);
 
 const addReportedUsage = (current: ReportedUsage, next: any): ReportedUsage => {
   if (!next || typeof next !== 'object') return current;
@@ -100,98 +121,110 @@ const streamOpenAICompatibleWithA2UI = async (params: {
   let fullContent = '';
   let reportedUsage: ReportedUsage = null;
 
-  for (let round = 0; round < MAX_A2UI_TOOL_ROUNDS; round++) {
-    let roundContent = '';
-    const toolCalls = new Map<number, { id: string; type: string; function: { name: string; arguments: string } }>();
-    const stream = await params.client.chat.completions.create({
-      model: params.model,
-      messages: providerMessages,
-      stream: true,
-      temperature: 1,
-      tools: [openAIA2UITool],
-      tool_choice: 'auto',
-      stream_options: { include_usage: true },
-    } as any);
+  try {
+    for (let round = 0; round < MAX_A2UI_TOOL_ROUNDS; round++) {
+      let roundContent = '';
+      const toolCalls = new Map<number, { id: string; type: string; function: { name: string; arguments: string } }>();
+      const stream = await params.client.chat.completions.create({
+        model: params.model,
+        messages: providerMessages,
+        stream: true,
+        temperature: 1,
+        tools: [openAIA2UITool],
+        tool_choice: 'auto',
+        stream_options: { include_usage: true },
+      } as any);
 
-    for await (const chunk of stream as any) {
-      if (chunk.usage) {
-        reportedUsage = addReportedUsage(reportedUsage, chunk.usage);
-      }
+      for await (const chunk of stream as any) {
+        if (chunk.usage) {
+          reportedUsage = addReportedUsage(reportedUsage, chunk.usage);
+        }
 
-      const choice = chunk.choices?.[0];
-      const contentChunk = choice?.delta?.content;
-      if (typeof contentChunk === 'string' && contentChunk.length > 0) {
-        fullContent += contentChunk;
-        roundContent += contentChunk;
-        params.emitTextChunk(contentChunk);
-        if (fullContent.length % 100 === 0) {
-          params.logger.debug('Streaming AI chunk', { messageId: params.messageId, contentLength: fullContent.length });
+        const choice = chunk.choices?.[0];
+        const contentChunk = choice?.delta?.content;
+        if (typeof contentChunk === 'string' && contentChunk.length > 0) {
+          fullContent += contentChunk;
+          roundContent += contentChunk;
+          params.emitTextChunk(contentChunk);
+          if (fullContent.length % 100 === 0) {
+            params.logger.debug('Streaming AI chunk', { messageId: params.messageId, contentLength: fullContent.length });
+          }
+        }
+
+        for (const delta of choice?.delta?.tool_calls || []) {
+          const index = typeof delta.index === 'number' ? delta.index : toolCalls.size;
+          const current = toolCalls.get(index) || {
+            id: delta.id || `a2ui_tool_${round}_${index}`,
+            type: delta.type || 'function',
+            function: { name: '', arguments: '' },
+          };
+          if (delta.id) current.id = delta.id;
+          if (delta.type) current.type = delta.type;
+          if (delta.function?.name) current.function.name += delta.function.name;
+          if (delta.function?.arguments) current.function.arguments += delta.function.arguments;
+          toolCalls.set(index, current);
         }
       }
 
-      for (const delta of choice?.delta?.tool_calls || []) {
-        const index = typeof delta.index === 'number' ? delta.index : toolCalls.size;
-        const current = toolCalls.get(index) || {
-          id: delta.id || `a2ui_tool_${round}_${index}`,
-          type: delta.type || 'function',
-          function: { name: '', arguments: '' },
-        };
-        if (delta.id) current.id = delta.id;
-        if (delta.type) current.type = delta.type;
-        if (delta.function?.name) current.function.name += delta.function.name;
-        if (delta.function?.arguments) current.function.arguments += delta.function.arguments;
-        toolCalls.set(index, current);
+      if (toolCalls.size === 0) {
+        break;
       }
-    }
 
-    if (toolCalls.size === 0) {
-      break;
-    }
+      const assistantToolCalls = [...toolCalls.entries()]
+        .sort(([left], [right]) => left - right)
+        .map(([, toolCall]) => toolCall);
+      const toolMessages: any[] = [];
 
-    const assistantToolCalls = [...toolCalls.entries()]
-      .sort(([left], [right]) => left - right)
-      .map(([, toolCall]) => toolCall);
-    const toolMessages: any[] = [];
+      for (const toolCall of assistantToolCalls) {
+        if (toolCall.function.name !== A2UI_TOOL_NAME) {
+          toolMessages.push({
+            role: 'tool',
+            tool_call_id: toolCall.id,
+            content: JSON.stringify({ ok: false, error: 'Unsupported tool' }),
+          });
+          continue;
+        }
 
-    for (const toolCall of assistantToolCalls) {
-      if (toolCall.function.name !== A2UI_TOOL_NAME) {
+        const uiPayload = await normalizeA2UIToolArguments(toolCall.function.arguments);
+        const rendered = uiPayload ? await params.emitA2UIUpdate(uiPayload.messages) : false;
+        if (!rendered) {
+          params.logger.warn('AI provider emitted invalid A2UI tool arguments', {
+            messageId: params.messageId,
+            toolCallId: toolCall.id,
+          });
+        }
         toolMessages.push({
           role: 'tool',
           tool_call_id: toolCall.id,
-          content: JSON.stringify({ ok: false, error: 'Unsupported tool' }),
+          content: JSON.stringify({ ok: rendered }),
         });
-        continue;
       }
 
-      const uiPayload = await normalizeA2UIToolArguments(toolCall.function.arguments);
-      const rendered = uiPayload ? await params.emitA2UIUpdate(uiPayload.messages) : false;
-      if (!rendered) {
-        params.logger.warn('AI provider emitted invalid A2UI tool arguments', {
+      providerMessages.push({
+        role: 'assistant',
+        content: roundContent || null,
+        tool_calls: assistantToolCalls,
+      });
+      providerMessages.push(...toolMessages);
+
+      if (round === MAX_A2UI_TOOL_ROUNDS - 1) {
+        params.logger.warn('Reached maximum A2UI tool rounds for OpenAI-compatible stream', {
           messageId: params.messageId,
-          toolCallId: toolCall.id,
+          maxRounds: MAX_A2UI_TOOL_ROUNDS,
         });
+        break;
       }
-      toolMessages.push({
-        role: 'tool',
-        tool_call_id: toolCall.id,
-        content: JSON.stringify({ ok: rendered }),
+    }
+  } catch (error) {
+    if (isPrematureCloseError(error) && fullContent.trim().length > 0) {
+      throw new PartialAIStreamError(error, {
+        fullContent,
+        reportedUsage,
+        usageMessages: providerMessages,
       });
     }
 
-    providerMessages.push({
-      role: 'assistant',
-      content: roundContent || null,
-      tool_calls: assistantToolCalls,
-    });
-    providerMessages.push(...toolMessages);
-
-    if (round === MAX_A2UI_TOOL_ROUNDS - 1) {
-      params.logger.warn('Reached maximum A2UI tool rounds for OpenAI-compatible stream', {
-        messageId: params.messageId,
-        maxRounds: MAX_A2UI_TOOL_ROUNDS,
-      });
-      break;
-    }
+    throw error;
   }
 
   return {
@@ -291,9 +324,29 @@ type AIRequestData = {
   systemPrompt?: string;
   roleName?: string;
   model?: string;
+  userMessageId?: string;
   editedMessageId?: string;
   retryForMessageId?: string;
   maxContextMessages?: number;
+  codeAgentMode?: CocoRunnerMode;
+};
+
+type AIRunnerMode = 'inline' | 'worker';
+
+export type QueuedAssistantRunPayload = {
+  runId: string;
+  roomId: string;
+  requestedByClientId: string;
+  aiMessageId: string;
+  userMessageId?: string;
+  roleName: string;
+  systemPrompt: string;
+  model?: string;
+  maxContextMessages: number;
+  retryForMessageId?: string;
+  editedMessageId?: string;
+  contextMessages: Message[];
+  historyUsedForContext: Message[];
 };
 
 type EditMessageAndAskAIData = AIRequestData & {
@@ -323,6 +376,439 @@ type SendMessageAndAskAIAckCallback = (response: {
   error?: string;
 }) => void;
 
+const resolveAIRunnerMode = (): AIRunnerMode => (
+  process.env.AI_RUNNER_MODE === 'worker' ? 'worker' : 'inline'
+);
+
+const shouldIncludeA2UIDemoTrigger = (roleName: string, systemPrompt: string): boolean => (
+  roleName.trim().toLowerCase() === 'a2ui demo'
+  || /A2UI streaming demo assistant/i.test(systemPrompt)
+);
+
+const buildSystemPromptWithA2UI = (systemPrompt: string, roleName: string) => (
+  buildA2UIToolSystemPrompt(systemPrompt, {
+    includeDemoTrigger: shouldIncludeA2UIDemoTrigger(roleName, systemPrompt),
+  })
+);
+
+const isQueuedAssistantRunPayload = (payload: unknown): payload is QueuedAssistantRunPayload => (
+  typeof payload === 'object' &&
+  payload !== null &&
+  typeof (payload as QueuedAssistantRunPayload).runId === 'string' &&
+  typeof (payload as QueuedAssistantRunPayload).roomId === 'string' &&
+  typeof (payload as QueuedAssistantRunPayload).requestedByClientId === 'string' &&
+  typeof (payload as QueuedAssistantRunPayload).aiMessageId === 'string' &&
+  Array.isArray((payload as QueuedAssistantRunPayload).contextMessages) &&
+  Array.isArray((payload as QueuedAssistantRunPayload).historyUsedForContext)
+);
+
+export const executeQueuedAssistantRun = async (
+  payload: unknown,
+  {
+    io,
+    store,
+    socketLogger,
+    openaiLogger,
+    normalizeAIModel,
+    getAIClientForModel,
+  }: SocketHandlerDeps,
+) => {
+  if (!isQueuedAssistantRunPayload(payload)) {
+    throw new Error('Invalid ai.run_requested payload');
+  }
+
+  const {
+    runId,
+    roomId,
+    requestedByClientId,
+    aiMessageId,
+    roleName,
+    systemPrompt,
+    contextMessages,
+    historyUsedForContext,
+  } = payload;
+  const selectedModel = normalizeAIModel(payload.model);
+  const initialAiMessage = createAIPlaceholderMessage({
+    id: aiMessageId,
+    roomId,
+    roleName,
+    model: selectedModel,
+  });
+
+  const updateAssistantRun = async (updates: {
+    status: 'running' | 'complete' | 'error' | 'cancelled';
+    error?: string;
+    startedAt?: string;
+    completedAt?: string;
+    metadata?: Record<string, unknown>;
+  }) => {
+    const now = new Date().toISOString();
+    const updated = await store.updateAssistantRun?.(runId, {
+      status: updates.status,
+      error: updates.error ?? null,
+      startedAt: updates.startedAt,
+      completedAt: updates.completedAt,
+      updatedAt: now,
+      metadata: updates.metadata,
+    });
+    if (!updated) {
+      openaiLogger.warn('Failed to update queued assistant run status', { runId, status: updates.status, roomId, messageId: aiMessageId });
+    }
+  };
+
+  const saveAIMessage = async (message: Message, logLabel: string): Promise<boolean> => {
+    try {
+      const updatedRoom = await store.upsertMessage(message);
+      if (!updatedRoom) {
+        openaiLogger.error(`Persistent store rejected worker ${logLabel} AI message`, { messageId: message.id, roomId, status: message.status });
+        return false;
+      }
+      io.to(updatedRoom.creatorId).emit('room_updated', updatedRoom);
+      openaiLogger.info(`Saved worker ${logLabel} AI message to persistent history`, {
+        messageId: message.id,
+        roomId,
+        status: message.status,
+      });
+      return true;
+    } catch (err) {
+      openaiLogger.error(`Failed to save worker ${logLabel} AI message to persistent history`, { error: err, messageId: message.id, roomId });
+      return false;
+    }
+  };
+
+  const saveAIErrorMessage = async (message: Message, logLabel: string): Promise<boolean> => {
+    for (let attempt = 1; attempt <= ERROR_STATE_SAVE_ATTEMPTS; attempt++) {
+      const saved = await saveAIMessage(message, attempt === 1 ? logLabel : `${logLabel} retry ${attempt}`);
+      if (saved) {
+        return true;
+      }
+
+      if (attempt < ERROR_STATE_SAVE_ATTEMPTS) {
+        await wait(ERROR_STATE_SAVE_RETRY_DELAY_MS * attempt);
+      }
+    }
+
+    openaiLogger.error('Failed to persist worker AI error state after retries; streaming message may need startup recovery', {
+      messageId: aiMessageId,
+      roomId,
+      attempts: ERROR_STATE_SAVE_ATTEMPTS,
+    });
+    io.to(roomId).emit('ai_persistence_error', {
+      messageId: aiMessageId,
+      error: 'AI response status could not be saved. It will be recovered if the server restarts.',
+      roomId,
+    });
+    return false;
+  };
+
+  const startedAt = new Date().toISOString();
+  await updateAssistantRun({
+    status: 'running',
+    startedAt,
+    metadata: { runnerMode: 'worker' },
+  });
+
+  let streamedTextContent = '';
+  let streamedA2UIPayload: Message['uiPayload'];
+  let fallbackUsageMessages: Array<{ content: any }> = [];
+
+  const emitA2UIUpdate = async (messages: unknown[]): Promise<boolean> => {
+    const uiPayload = await normalizeA2UIPayload(messages);
+    if (!uiPayload) {
+      openaiLogger.warn('Ignoring invalid worker A2UI stream update', { messageId: aiMessageId, roomId });
+      return false;
+    }
+
+    streamedA2UIPayload = mergeA2UIPayloads(streamedA2UIPayload, uiPayload);
+    io.to(roomId).emit('a2ui_update', {
+      messageId: aiMessageId,
+      roomId,
+      uiPayload,
+    });
+    return true;
+  };
+
+  try {
+    if (isE2EFakeAIEnabled()) {
+      const lastUserMessage = [...historyUsedForContext].reverse().find(message => message.clientId !== 'ai_assistant');
+      const targetContent = lastUserMessage?.content?.trim() || 'empty prompt';
+      const chunks = [
+        'E2E AI response: ',
+        `I received "${targetContent}". `,
+        'The text stream is still moving while the UI surface updates. ',
+        'The card below includes live status, checklist items, and an action.',
+      ];
+      const chunkDelayMs = getE2EFakeAIChunkDelayMs();
+      for (const chunk of chunks) {
+        await wait(chunkDelayMs);
+        streamedTextContent += chunk;
+        io.to(roomId).emit('ai_chunk', { messageId: aiMessageId, chunk, roomId });
+      }
+      const usage = {
+        promptTokens: 100,
+        completionTokens: 20,
+        totalTokens: 120,
+        cachedPromptTokens: 25,
+        cacheHitRate: 0.25,
+        source: 'reported' as const,
+      };
+      const cost = calculateAICost(selectedModel, usage);
+      const roomCostTotal = await store.incrementRoomAICost(roomId, cost || null);
+      const aiModel = getMessageAIModel(selectedModel);
+      const finalAiMessage: Message = {
+        ...initialAiMessage,
+        content: streamedTextContent,
+        status: 'complete',
+        timestamp: new Date().toISOString(),
+        aiModel,
+        usage,
+        cost,
+      };
+      const finalSaved = await saveAIMessage(finalAiMessage, 'E2E fake complete');
+      if (!finalSaved) {
+        throw new Error('Failed to save final AI response');
+      }
+      await updateAssistantRun({
+        status: 'complete',
+        completedAt: new Date().toISOString(),
+        metadata: { runnerMode: 'worker', contentLength: streamedTextContent.length, usage, cost },
+      });
+      io.to(roomId).emit('ai_stream_end', {
+        messageId: aiMessageId,
+        roomId,
+        content: finalAiMessage.content,
+        aiModel,
+        usage,
+        cost,
+        sessionCost: roomCostTotal,
+      });
+      io.to(roomId).emit('ai_cost_total', roomCostTotal);
+      return;
+    }
+
+    const systemPromptWithA2UI = buildSystemPromptWithA2UI(systemPrompt, roleName);
+    const validMessagesForAPI = buildAIProviderMessages(systemPromptWithA2UI, contextMessages);
+    fallbackUsageMessages = validMessagesForAPI;
+    const hasUserOrAssistantMessage = validMessagesForAPI.some(msg => msg.role === 'user' || msg.role === 'assistant');
+    if (!hasUserOrAssistantMessage && validMessagesForAPI.length <= 1) {
+      const errorAiMessage: Message = {
+        ...initialAiMessage,
+        status: 'error',
+        content: 'Cannot generate a response without any context or question.',
+        timestamp: new Date().toISOString(),
+      };
+      await saveAIErrorMessage(errorAiMessage, 'empty-context error');
+      io.to(roomId).emit('ai_stream_error', {
+        messageId: aiMessageId,
+        error: 'Sorry, cannot generate a response without any context or question.',
+        roomId,
+      });
+      await updateAssistantRun({ status: 'error', completedAt: new Date().toISOString(), error: 'Cannot generate a response without context' });
+      return;
+    }
+
+    openaiLogger.debug('Worker sending messages to AI provider', {
+      messages: validMessagesForAPI,
+      contextLengthUsed: contextMessages.length,
+      model: selectedModel.id,
+      apiModel: selectedModel.apiModel,
+      provider: selectedModel.provider,
+      runId,
+    });
+
+    const aiClientWrapper = getAIClientForModel(selectedModel);
+    let fullContent = '';
+    let reportedUsage: any = null;
+    let usageMessages: Array<{ content: any }> = validMessagesForAPI;
+
+    if (aiClientWrapper.provider === 'anthropic') {
+      const anthropicMessages = buildAnthropicMessages(contextMessages);
+      const streamResult = await streamAnthropicWithA2UI({
+        client: aiClientWrapper.client,
+        model: selectedModel.apiModel,
+        systemPrompt: systemPromptWithA2UI,
+        messages: anthropicMessages as any[],
+        emitA2UIUpdate,
+        emitTextChunk: (chunk) => {
+          streamedTextContent += chunk;
+          io.to(roomId).emit('ai_chunk', { messageId: aiMessageId, chunk, roomId });
+        },
+        logger: openaiLogger,
+        messageId: aiMessageId,
+      });
+      fullContent = streamResult.fullContent;
+      streamedTextContent = fullContent;
+      reportedUsage = streamResult.reportedUsage;
+      usageMessages = streamResult.usageMessages;
+    } else {
+      const streamResult = await streamOpenAICompatibleWithA2UI({
+        client: aiClientWrapper.client,
+        model: selectedModel.apiModel,
+        messages: validMessagesForAPI as any[],
+        emitA2UIUpdate,
+        emitTextChunk: (chunk) => {
+          streamedTextContent += chunk;
+          io.to(roomId).emit('ai_chunk', { messageId: aiMessageId, chunk, roomId });
+        },
+        logger: openaiLogger,
+        messageId: aiMessageId,
+      });
+      fullContent = streamResult.fullContent;
+      streamedTextContent = fullContent;
+      reportedUsage = streamResult.reportedUsage;
+      usageMessages = streamResult.usageMessages;
+    }
+
+    const usage = normalizeUsage(reportedUsage, usageMessages, fullContent);
+    const cost = calculateAICost(selectedModel, usage);
+    const roomCostTotal = await store.incrementRoomAICost(roomId, cost || null);
+    const aiModel = getMessageAIModel(selectedModel);
+    const finalAiMessage: Message = {
+      ...initialAiMessage,
+      content: fullContent,
+      status: 'complete',
+      timestamp: new Date().toISOString(),
+      aiModel,
+      usage,
+      cost,
+    };
+    if (streamedA2UIPayload) {
+      finalAiMessage.uiPayload = streamedA2UIPayload;
+    }
+
+    const finalSaved = await saveAIMessage(finalAiMessage, 'complete');
+    if (!finalSaved) {
+      await saveAIErrorMessage({
+        ...initialAiMessage,
+        status: 'error',
+        content: streamedTextContent || 'Error saving response.',
+        timestamp: new Date().toISOString(),
+      }, 'final-save error');
+      io.to(roomId).emit('ai_stream_error', {
+        messageId: aiMessageId,
+        error: 'Sorry, unable to save the AI response.',
+        roomId,
+      });
+      await updateAssistantRun({ status: 'error', completedAt: new Date().toISOString(), error: 'Failed to save final AI response' });
+      return;
+    }
+
+    await updateAssistantRun({
+      status: 'complete',
+      completedAt: new Date().toISOString(),
+      metadata: { runnerMode: 'worker', contentLength: fullContent.length, usage, cost },
+    });
+    io.to(roomId).emit('ai_stream_end', {
+      messageId: aiMessageId,
+      roomId,
+      content: finalAiMessage.content,
+      uiPayload: finalAiMessage.uiPayload,
+      aiModel,
+      usage,
+      cost,
+      sessionCost: roomCostTotal,
+    });
+    io.to(roomId).emit('ai_cost_total', roomCostTotal);
+    openaiLogger.info('Worker AI stream ended', {
+      runId,
+      messageId: aiMessageId,
+      contentLength: fullContent.length,
+      model: selectedModel.id,
+      usage,
+      cost,
+      roomCostTotal,
+    });
+  } catch (error) {
+    socketLogger.error('Error processing queued AI stream request', {
+      error: error instanceof Error ? error.message : error,
+      clientId: requestedByClientId,
+      roomId,
+      runId,
+    });
+
+    const partialStreamResult = getPartialAIStreamResult(error);
+    const partialContent = partialStreamResult?.fullContent || streamedTextContent;
+    const hasPartialContent = partialContent.trim().length > 0;
+    if (hasPartialContent && isPrematureCloseError(error)) {
+      const usage = normalizeUsage(
+        partialStreamResult?.reportedUsage ?? null,
+        partialStreamResult?.usageMessages ?? fallbackUsageMessages,
+        partialContent,
+      );
+      const cost = calculateAICost(selectedModel, usage);
+      const roomCostTotal = await store.incrementRoomAICost(roomId, cost || null);
+      const aiModel = getMessageAIModel(selectedModel);
+      const finalAiMessage: Message = {
+        ...initialAiMessage,
+        content: partialContent,
+        status: 'complete',
+        timestamp: new Date().toISOString(),
+        aiModel,
+        usage,
+        cost,
+      };
+      if (streamedA2UIPayload) {
+        finalAiMessage.uiPayload = streamedA2UIPayload;
+      }
+      const finalSaved = await saveAIMessage(finalAiMessage, 'premature-close complete');
+      if (!finalSaved) {
+        throw new Error('Failed to save premature-close AI response');
+      }
+      await updateAssistantRun({
+        status: 'complete',
+        completedAt: new Date().toISOString(),
+        metadata: { runnerMode: 'worker', contentLength: partialContent.length, usage, cost, completedAfterPrematureClose: true },
+      });
+      io.to(roomId).emit('ai_stream_end', {
+        messageId: aiMessageId,
+        roomId,
+        content: finalAiMessage.content,
+        uiPayload: finalAiMessage.uiPayload,
+        aiModel,
+        usage,
+        cost,
+        sessionCost: roomCostTotal,
+        completedAfterPrematureClose: true,
+      });
+      io.to(roomId).emit('ai_cost_total', roomCostTotal);
+      openaiLogger.warn('Worker AI stream closed prematurely after content; treating response as complete', {
+        runId,
+        messageId: aiMessageId,
+        roomId,
+        contentLength: partialContent.length,
+        model: selectedModel.id,
+        usageSource: usage.source,
+      });
+      return;
+    }
+
+    const errorAiMessage: Message = {
+      ...initialAiMessage,
+      status: 'error',
+      content: streamedTextContent || 'Error generating response.',
+      timestamp: new Date().toISOString(),
+    };
+    if (streamedA2UIPayload) {
+      errorAiMessage.uiPayload = streamedA2UIPayload;
+    }
+    await saveAIErrorMessage(errorAiMessage, 'stream error');
+    io.to(roomId).emit('ai_stream_error', {
+      messageId: aiMessageId,
+      error: hasPartialContent
+        ? 'The AI provider connection closed before a normal finish. The partial response above was saved.'
+        : 'Sorry, an error occurred while generating the AI response.',
+      roomId,
+      partial: hasPartialContent,
+    });
+    await updateAssistantRun({
+      status: 'error',
+      completedAt: new Date().toISOString(),
+      error: error instanceof Error ? error.message : 'Error generating response',
+      metadata: hasPartialContent ? { runnerMode: 'worker', partial: true, contentLength: streamedTextContent.length } : { runnerMode: 'worker' },
+    });
+  }
+};
+
 export function registerAIHandlers({
   io,
   socket,
@@ -332,6 +818,7 @@ export function registerAIHandlers({
   normalizeAIModel,
   getAIClientForModel,
   aiStreamOwnerId,
+  cocoSessionService,
 }: SocketConnectionContext) {
   const emitLatestHistoryPage = async (roomId: string) => {
     const page = await store.readMessagePageByRoom(roomId);
@@ -350,6 +837,8 @@ export function registerAIHandlers({
     const { roomId, systemPrompt = DEFAULT_SYSTEM_MESSAGE, roleName = 'AI Assistant', editedMessageId, retryForMessageId } = data;
     const selectedModel = normalizeAIModel(data.model);
     const aiMessageId = uuidv4();
+    const aiRunId = uuidv4();
+    let assistantRunRecorded = false;
 
     socketLogger.info(`Received AI request (history-based)${editedMessageId ? ' after edit ' + editedMessageId : ''}${retryForMessageId ? ' as retry for ' + retryForMessageId : ''}`, {
       socketId: socket.id,
@@ -372,6 +861,87 @@ export function registerAIHandlers({
       return;
     }
     const maxContextMessages = normalizeAIContextMessageLimit(data.maxContextMessages, MAX_CONTEXT_MESSAGES);
+
+    const runnerMode = resolveAIRunnerMode();
+    const recordAssistantRunStart = async (mode: AIRunnerMode, queuedPayload?: QueuedAssistantRunPayload): Promise<boolean> => {
+      const now = new Date().toISOString();
+      const isWorkerMode = mode === 'worker';
+      const run = {
+        id: aiRunId,
+        roomId,
+        requestedByClientId: clientId,
+        userMessageId: data.userMessageId,
+        aiMessageId,
+        status: isWorkerMode ? 'queued' as const : 'running' as const,
+        modelId: selectedModel.id,
+        apiModel: selectedModel.apiModel,
+        provider: selectedModel.provider,
+        roleName,
+        systemPrompt,
+        maxContextMessages,
+        retryForMessageId,
+        editedMessageId,
+        createdAt: now,
+        queuedAt: now,
+        startedAt: isWorkerMode ? undefined : now,
+        updatedAt: now,
+        metadata: {
+          runnerMode: mode,
+        },
+      };
+      const event = {
+        id: uuidv4(),
+        eventType: isWorkerMode ? 'ai.run_requested' : 'ai.run.inline_started',
+        aggregateType: 'assistant_run',
+        aggregateId: aiRunId,
+        roomId,
+        payload: isWorkerMode && queuedPayload ? queuedPayload : {
+          runId: aiRunId,
+          roomId,
+          aiMessageId,
+          userMessageId: data.userMessageId,
+          model: selectedModel.id,
+          runnerMode: 'inline',
+        },
+        status: isWorkerMode ? 'pending' as const : 'processed' as const,
+        attempts: isWorkerMode ? 0 : 1,
+        availableAt: now,
+        processedAt: isWorkerMode ? undefined : now,
+        createdAt: now,
+        updatedAt: now,
+      };
+      if (!store.createAssistantRunWithOutbox) {
+        openaiLogger.debug('Assistant run recording unavailable on store', { runId: aiRunId, messageId: aiMessageId, roomId, runnerMode: mode });
+        return false;
+      }
+      const recorded = await store.createAssistantRunWithOutbox(run, event);
+      assistantRunRecorded = Boolean(recorded);
+      if (!recorded) {
+        openaiLogger.warn('Failed to record assistant run start', { runId: aiRunId, messageId: aiMessageId, roomId, runnerMode: mode });
+      }
+      return Boolean(recorded);
+    };
+
+    const updateAssistantRun = async (updates: {
+      status: 'complete' | 'error' | 'cancelled';
+      error?: string;
+      metadata?: Record<string, unknown>;
+    }) => {
+      if (!assistantRunRecorded) {
+        return;
+      }
+      const now = new Date().toISOString();
+      const updated = await store.updateAssistantRun?.(aiRunId, {
+        status: updates.status,
+        error: updates.error ?? null,
+        completedAt: now,
+        updatedAt: now,
+        metadata: updates.metadata,
+      });
+      if (!updated) {
+        openaiLogger.warn('Failed to update assistant run status', { runId: aiRunId, status: updates.status, roomId, messageId: aiMessageId });
+      }
+    };
 
     if (retryForMessageId) {
       const retryTarget = await getRoomMessage(store, roomId, retryForMessageId);
@@ -560,10 +1130,49 @@ export function registerAIHandlers({
       callback?.({ success: false, error: 'Unable to start a durable AI response' });
       return;
     }
+    const queuedPayload: QueuedAssistantRunPayload | undefined = runnerMode === 'worker'
+      ? {
+        runId: aiRunId,
+        roomId,
+        requestedByClientId: clientId,
+        aiMessageId,
+        userMessageId: data.userMessageId,
+        roleName,
+        systemPrompt,
+        model: selectedModel.id,
+        maxContextMessages,
+        retryForMessageId,
+        editedMessageId,
+        contextMessages,
+        historyUsedForContext,
+      }
+      : undefined;
+    const runRecorded = await recordAssistantRunStart(runnerMode, queuedPayload);
+    if (runnerMode === 'worker' && !runRecorded) {
+      await saveAIErrorMessage({
+        ...initialAiMessage,
+        status: 'error',
+        content: 'Unable to queue AI response.',
+        timestamp: new Date().toISOString(),
+      }, 'queue error');
+      io.to(roomId).emit('ai_stream_error', {
+        messageId: aiMessageId,
+        error: 'Sorry, unable to queue the AI response.',
+        roomId,
+      });
+      callback?.({ success: false, error: 'Unable to queue AI response' });
+      return;
+    }
     io.to(roomId).emit('new_message', initialAiMessage);
     callback?.({ success: true, messageId: aiMessageId });
+    if (runnerMode === 'worker') {
+      openaiLogger.info('Queued AI run for outbox worker', { runId: aiRunId, messageId: aiMessageId, roomId, model: selectedModel.id });
+      return;
+    }
 
+    let streamedTextContent = '';
     let streamedA2UIPayload: Message['uiPayload'];
+    let fallbackUsageMessages: Array<{ content: any }> = [];
     const emitA2UIUpdate = async (messages: unknown[]): Promise<boolean> => {
       const uiPayload = await normalizeA2UIPayload(messages);
       if (!uiPayload) {
@@ -851,8 +1460,18 @@ export function registerAIHandlers({
           error: 'Sorry, unable to save the AI response.',
           roomId,
         });
+        await updateAssistantRun({ status: 'error', error: 'Failed to save final AI response' });
         return;
       }
+
+      await updateAssistantRun({
+        status: 'complete',
+        metadata: {
+          contentLength: fullContent.length,
+          usage,
+          cost,
+        },
+      });
 
       io.to(roomId).emit('ai_stream_end', {
         messageId: aiMessageId,
@@ -869,8 +1488,9 @@ export function registerAIHandlers({
     }
 
     try {
-      const systemPromptWithA2UI = buildA2UIToolSystemPrompt(systemPrompt);
+      const systemPromptWithA2UI = buildSystemPromptWithA2UI(systemPrompt, roleName);
       const validMessagesForAPI = buildAIProviderMessages(systemPromptWithA2UI, contextMessages);
+      fallbackUsageMessages = validMessagesForAPI;
       const hasUserOrAssistantMessage = validMessagesForAPI.some(msg => msg.role === 'user' || msg.role === 'assistant');
       if (!hasUserOrAssistantMessage && validMessagesForAPI.length <= 1) {
         openaiLogger.error('Cannot call OpenAI API without user or assistant messages in context.', { roomId });
@@ -886,6 +1506,7 @@ export function registerAIHandlers({
           error: 'Sorry, cannot generate a response without any context or question.',
           roomId,
         });
+        await updateAssistantRun({ status: 'error', error: 'Cannot generate a response without context' });
         return;
       }
 
@@ -911,11 +1532,15 @@ export function registerAIHandlers({
           systemPrompt: systemPromptWithA2UI,
           messages: anthropicMessages as any[],
           emitA2UIUpdate,
-          emitTextChunk: (chunk) => io.to(roomId).emit('ai_chunk', { messageId: aiMessageId, chunk, roomId }),
+          emitTextChunk: (chunk) => {
+            streamedTextContent += chunk;
+            io.to(roomId).emit('ai_chunk', { messageId: aiMessageId, chunk, roomId });
+          },
           logger: openaiLogger,
           messageId: aiMessageId,
         });
         fullContent = streamResult.fullContent;
+        streamedTextContent = fullContent;
         reportedUsage = streamResult.reportedUsage;
         usageMessages = streamResult.usageMessages;
       } else {
@@ -924,11 +1549,15 @@ export function registerAIHandlers({
           model: selectedModel.apiModel,
           messages: validMessagesForAPI as any[],
           emitA2UIUpdate,
-          emitTextChunk: (chunk) => io.to(roomId).emit('ai_chunk', { messageId: aiMessageId, chunk, roomId }),
+          emitTextChunk: (chunk) => {
+            streamedTextContent += chunk;
+            io.to(roomId).emit('ai_chunk', { messageId: aiMessageId, chunk, roomId });
+          },
           logger: openaiLogger,
           messageId: aiMessageId,
         });
         fullContent = streamResult.fullContent;
+        streamedTextContent = fullContent;
         reportedUsage = streamResult.reportedUsage;
         usageMessages = streamResult.usageMessages;
       }
@@ -963,8 +1592,18 @@ export function registerAIHandlers({
           error: 'Sorry, unable to save the AI response.',
           roomId,
         });
+        await updateAssistantRun({ status: 'error', error: 'Failed to save final AI response' });
         return;
       }
+
+      await updateAssistantRun({
+        status: 'complete',
+        metadata: {
+          contentLength: fullContent.length,
+          usage,
+          cost,
+        },
+      });
 
       io.to(roomId).emit('ai_stream_end', {
         messageId: aiMessageId,
@@ -992,17 +1631,104 @@ export function registerAIHandlers({
         clientId,
         roomId,
       });
+
+      const partialStreamResult = getPartialAIStreamResult(error);
+      const partialContent = partialStreamResult?.fullContent || streamedTextContent;
+      const hasPartialContent = partialContent.trim().length > 0;
+      if (hasPartialContent && isPrematureCloseError(error)) {
+        const usage = normalizeUsage(
+          partialStreamResult?.reportedUsage ?? null,
+          partialStreamResult?.usageMessages ?? fallbackUsageMessages,
+          partialContent,
+        );
+        const cost = calculateAICost(selectedModel, usage);
+        const roomCostTotal = await store.incrementRoomAICost(roomId, cost || null);
+        const aiModel = getMessageAIModel(selectedModel);
+        const finalAiMessage: Message = {
+          ...initialAiMessage,
+          content: partialContent,
+          status: 'complete',
+          timestamp: new Date().toISOString(),
+          aiModel,
+          usage,
+          cost,
+        };
+        if (streamedA2UIPayload) {
+          finalAiMessage.uiPayload = streamedA2UIPayload;
+        }
+
+        const finalSaved = await saveAIMessage(finalAiMessage, 'premature-close complete');
+        if (!finalSaved) {
+          await saveAIErrorMessage({
+            ...initialAiMessage,
+            status: 'error',
+            content: streamedTextContent,
+            timestamp: new Date().toISOString(),
+          }, 'premature-close final-save error');
+          io.to(roomId).emit('ai_stream_error', {
+            messageId: aiMessageId,
+            error: 'The AI response was generated, but could not be saved.',
+            roomId,
+            partial: true,
+          });
+          await updateAssistantRun({ status: 'error', error: 'Failed to save premature-close AI response' });
+          return;
+        }
+
+        await updateAssistantRun({
+          status: 'complete',
+          metadata: {
+            contentLength: partialContent.length,
+            usage,
+            cost,
+            completedAfterPrematureClose: true,
+          },
+        });
+
+        io.to(roomId).emit('ai_stream_end', {
+          messageId: aiMessageId,
+          roomId,
+          content: finalAiMessage.content,
+          uiPayload: finalAiMessage.uiPayload,
+          aiModel,
+          usage,
+          cost,
+          sessionCost: roomCostTotal,
+          completedAfterPrematureClose: true,
+        });
+        io.to(roomId).emit('ai_cost_total', roomCostTotal);
+        openaiLogger.warn('AI stream closed prematurely after content; treating response as complete', {
+          messageId: aiMessageId,
+          roomId,
+          contentLength: partialContent.length,
+          model: selectedModel.id,
+          usageSource: usage.source,
+        });
+        return;
+      }
+
       const errorAiMessage: Message = {
         ...initialAiMessage,
         status: 'error',
-        content: 'Error generating response.',
+        content: streamedTextContent || 'Error generating response.',
         timestamp: new Date().toISOString(),
       };
+      if (streamedA2UIPayload) {
+        errorAiMessage.uiPayload = streamedA2UIPayload;
+      }
       await saveAIErrorMessage(errorAiMessage, 'stream error');
       io.to(roomId).emit('ai_stream_error', {
         messageId: aiMessageId,
-        error: 'Sorry, an error occurred while generating the AI response.',
+        error: hasPartialContent
+          ? 'The AI provider connection closed before a normal finish. The partial response above was saved.'
+          : 'Sorry, an error occurred while generating the AI response.',
         roomId,
+        partial: hasPartialContent,
+      });
+      await updateAssistantRun({
+        status: 'error',
+        error: error instanceof Error ? error.message : 'Error generating response',
+        metadata: hasPartialContent ? { partial: true, contentLength: streamedTextContent.length } : undefined,
       });
     }
   };
@@ -1024,6 +1750,24 @@ export function registerAIHandlers({
     if (!(await hasRoomAccess(store, data.roomId, clientId))) {
       socket.emit('error', { message: 'You are not authorized to access this room' });
       callback?.({ success: false, error: 'You are not authorized to access this room' });
+      return;
+    }
+
+    const room = await store.getRoomById(data.roomId);
+    if (room?.type === 'coco') {
+      if (!cocoSessionService) {
+        socket.emit('error', { message: 'Coco is unavailable' });
+        callback?.({ success: false, error: 'Coco is unavailable' });
+        return;
+      }
+
+      await cocoSessionService.startTurn({
+        roomId: data.roomId,
+        clientId,
+        selectedModel: normalizeAIModel(data.model),
+        roleName: data.roleName,
+        ...(data.codeAgentMode ? { mode: data.codeAgentMode } : {}),
+      }, callback);
       return;
     }
 
@@ -1069,6 +1813,7 @@ export function registerAIHandlers({
       return;
     }
 
+    const roomForAIRequest = await store.getRoomById(data.roomId);
     let roomMessages: Message[] = [];
     let replyTo;
     if (data.replyToMessageId) {
@@ -1108,6 +1853,44 @@ export function registerAIHandlers({
     io.to(data.roomId).emit('new_message', userMessage);
     notifyRoomMessageBestEffort({ store, room: updatedRoom, message: userMessage, logger: socketLogger });
 
+    if (roomForAIRequest?.type === 'coco') {
+      if (!cocoSessionService) {
+        callback?.({
+          success: true,
+          userMessage,
+          aiStarted: false,
+          aiError: 'Coco is unavailable',
+        });
+        return;
+      }
+
+      await cocoSessionService.startTurn({
+        roomId: data.roomId,
+        clientId,
+        selectedModel: normalizeAIModel(data.model),
+        roleName: data.roleName,
+        ...(data.codeAgentMode ? { mode: data.codeAgentMode } : {}),
+      }, (response) => {
+        if (response.success && response.messageId) {
+          callback?.({
+            success: true,
+            userMessage,
+            aiMessageId: response.messageId,
+            aiStarted: true,
+          });
+          return;
+        }
+
+        callback?.({
+          success: true,
+          userMessage,
+          aiStarted: false,
+          aiError: response.error || 'Failed to start Coco response',
+        });
+      });
+      return;
+    }
+
     const latestHistory = await store.readMessagesByRoom(data.roomId);
     const preparedHistory = latestHistory.some(message => message.id === userMessage.id)
       ? latestHistory
@@ -1119,6 +1902,7 @@ export function registerAIHandlers({
         systemPrompt: data.systemPrompt,
         roleName: data.roleName,
         model: data.model,
+        userMessageId: userMessage.id,
       },
       clientId,
       (response) => {
@@ -1162,6 +1946,13 @@ export function registerAIHandlers({
       return;
     }
 
+    const room = await store.getRoomById(data.roomId);
+    const isCocoRoom = room?.type === 'coco';
+    if (isCocoRoom && !cocoSessionService) {
+      callback?.({ success: false, error: 'Coco is unavailable' });
+      return;
+    }
+
     const targetMessage = await getRoomMessage(store, data.roomId, data.messageId);
     if (!targetMessage) {
       callback?.({ success: false, error: 'Message not found' });
@@ -1193,6 +1984,17 @@ export function registerAIHandlers({
     io.to(editResult.room.creatorId).emit('room_updated', editResult.room);
     io.to(data.roomId).emit('message_edited', editResult.updatedMessage);
     await emitLatestHistoryPage(data.roomId);
+
+    if (isCocoRoom) {
+      await cocoSessionService!.startTurn({
+        roomId: data.roomId,
+        clientId,
+        selectedModel: normalizeAIModel(data.model),
+        roleName: data.roleName,
+        ...(data.codeAgentMode ? { mode: data.codeAgentMode } : {}),
+      }, callback);
+      return;
+    }
 
     await startAIResponse({
       roomId: data.roomId,
@@ -1266,6 +2068,7 @@ export function registerAIHandlers({
         systemPrompt: typeof followUpRequest.systemPrompt === 'string' ? followUpRequest.systemPrompt : undefined,
         roleName: typeof followUpRequest.roleName === 'string' ? followUpRequest.roleName : undefined,
         model: typeof followUpRequest.model === 'string' ? followUpRequest.model : owningMessage.aiModel?.id,
+        userMessageId: followUpMessage.id,
         maxContextMessages: typeof followUpRequest.maxContextMessages === 'number' ? followUpRequest.maxContextMessages : undefined,
       },
       clientId,

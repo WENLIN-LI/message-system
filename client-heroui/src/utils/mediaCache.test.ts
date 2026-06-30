@@ -4,10 +4,24 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   getCachedMediaBlob,
   getCachedMediaObjectUrl,
+  getCachedMediaObjectUrlFromCache,
   getCachedVideoPosterUrl,
   shouldCacheMediaBody,
   SMALL_VIDEO_CACHE_MAX_BYTES,
 } from "./mediaCache";
+
+const readBlobText = (blob: Blob) => {
+  if (typeof blob.text === "function") {
+    return blob.text();
+  }
+
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error || new Error("Failed to read blob"));
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.readAsText(blob);
+  });
+};
 
 describe("mediaCache", () => {
   const cachesByName = new Map<string, Map<string, Response>>();
@@ -72,7 +86,7 @@ describe("mediaCache", () => {
   });
 
   it("returns cached media blobs for local download and share", async () => {
-    fetchMock.mockResolvedValueOnce(new Response("audio", {
+    fetchMock.mockResolvedValueOnce(new Response(new TextEncoder().encode("audio"), {
       status: 200,
       headers: { "Content-Type": "audio/webm" },
     }));
@@ -87,8 +101,26 @@ describe("mediaCache", () => {
 
     const cachedBlob = await getCachedMediaBlob("audio-asset");
 
+    expect(cachedBlob).not.toBeNull();
     expect(cachedBlob?.type).toBe("audio/webm");
-    await expect(cachedBlob?.text()).resolves.toBe("audio");
+    await expect(readBlobText(cachedBlob!)).resolves.toBe("audio");
+  });
+
+  it("returns cached media object URLs without fetching", async () => {
+    const bodyCache = new Map<string, Response>();
+    bodyCache.set(
+      "/roomtalk-media-cache/body/cached-image-asset",
+      new Response(new Blob(["image"], { type: "image/webp" }), { status: 200 }),
+    );
+    cachesByName.set("roomtalk-media-body-v1", bodyCache);
+
+    await expect(getCachedMediaObjectUrlFromCache({
+      assetId: "cached-image-asset",
+      kind: "image",
+      byteSize: 5,
+    })).resolves.toBe("blob:cached-0");
+
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("caches audio bodies but skips oversized video bodies", async () => {

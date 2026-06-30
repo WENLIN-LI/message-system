@@ -2,6 +2,7 @@ import assert from 'assert/strict';
 import { describe, it } from 'node:test';
 import { RedisStore } from './redisStore';
 import { AICost, MediaAsset, Message, Room } from '../types';
+import { OutboxEventRecord } from './store';
 
 const toTime = (value?: string) => Date.parse(value || '') || 0;
 const latest = (first?: string, second?: string) => toTime(first) >= toTime(second) ? first : second;
@@ -151,6 +152,10 @@ class MemoryRedis {
     const offset = options?.LIMIT?.offset ?? 0;
     const count = options?.LIMIT?.count ?? sorted.length;
     return sorted.slice(offset, offset + count);
+  }
+
+  async zRangeByScore(key: string, min: number | string, max: number | string, options?: { LIMIT?: { offset: number; count: number } }) {
+    return this.zRange(key, min, max, options);
   }
 
   async zRem(key: string, value: string) {
@@ -338,6 +343,16 @@ class MemoryRedis {
       return [1, 1, list.length, JSON.stringify(updatedRoom)];
     }
 
+    if (script.includes('return { 1, #ARGV - 1 }')) {
+      const [, messageKey] = options.keys;
+      const [roomId, ...messages] = options.arguments;
+      if (!this.hash('rooms').has(roomId)) {
+        return [0, 0];
+      }
+      this.lists.set(messageKey, messages);
+      return [1, messages.length];
+    }
+
     const [, messageKey] = options.keys;
     const [roomId, lastActivityAt, ...messages] = options.arguments;
     const updatedRoom = this.updateRoomActivity(roomId, lastActivityAt);
@@ -410,7 +425,7 @@ class KeysOnlyRedis extends MemoryRedis {
 
 class FailingReplaceRedis extends MemoryRedis {
   async eval(script: string, options: { keys: string[]; arguments: string[] }) {
-    if (script.includes('for i = 3, #ARGV do')) {
+    if (script.includes('for i = 3, #ARGV do') || script.includes('return { 1, #ARGV - 1 }')) {
       throw new Error('replace failed');
     }
     return super.eval(script, options);
@@ -503,6 +518,20 @@ const cost = (totalUsd: number): AICost => ({
   inputPerMillion: 1,
   outputPerMillion: 1,
   estimated: false,
+});
+
+const outboxEvent = (overrides: Partial<OutboxEventRecord> = {}): OutboxEventRecord => ({
+  id: 'event-1',
+  eventType: 'test.event',
+  aggregateType: 'test',
+  aggregateId: 'aggregate-1',
+  payload: {},
+  status: 'pending',
+  attempts: 0,
+  availableAt: '2026-06-22T00:00:00.000Z',
+  createdAt: '2026-06-22T00:00:00.000Z',
+  updatedAt: '2026-06-22T00:00:00.000Z',
+  ...overrides,
 });
 
 const createStore = () => {
@@ -936,6 +965,34 @@ describe('RedisStore', () => {
     assert.deepEqual(await store.readRoomAICost('room-bad'), { roomId: 'room-bad', currency: 'USD', totalUsd: 0 });
   });
 
+  it('does not reclaim terminally failed outbox events', async () => {
+    const { store } = createStore();
+    const saved = await store.createOutboxEvent(outboxEvent());
+    assert.ok(saved);
+
+    const claimed = await store.claimOutboxEvents({
+      workerId: 'worker-1',
+      now: '2026-06-22T00:00:01.000Z',
+      lockMs: 60_000,
+    });
+    assert.equal(claimed.length, 1);
+    assert.equal(claimed[0].status, 'processing');
+    assert.equal(claimed[0].attempts, 1);
+
+    const failed = await store.markOutboxEventFailed('event-1', 'boom', {
+      maxAttempts: 1,
+      now: '2026-06-22T00:00:02.000Z',
+    });
+    assert.equal(failed?.status, 'failed');
+
+    const reclaimed = await store.claimOutboxEvents({
+      workerId: 'worker-2',
+      now: '2026-06-22T00:00:03.000Z',
+      lockMs: 60_000,
+    });
+    assert.deepEqual(reclaimed, []);
+  });
+
   it('reads, writes, and invalidates room message caches', async () => {
     const { redis, store } = createStore();
     const cachedMessages = [message({ id: 'cached-message' })];
@@ -1135,9 +1192,11 @@ describe('RedisStore', () => {
       completeMessage,
     ]);
     await store.writeRoomMessagesCache('room-1', [streamingMessage, completeMessage]);
+    const roomBeforeRecovery = await store.getRoomById('room-1');
 
     assert.equal(await store.failInterruptedStreamingMessages('Response interrupted.'), 1);
     assert.equal(await store.readCachedRoomMessages('room-1'), null);
+    assert.deepEqual(await store.getRoomById('room-1'), roomBeforeRecovery);
 
     const recoveredMessages = await store.readMessagesByRoom('room-1');
     assert.notEqual(recoveredMessages[0].timestamp, streamingMessage.timestamp);

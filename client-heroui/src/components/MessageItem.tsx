@@ -22,9 +22,11 @@ import { getVideoPreviewUrl } from "../utils/videoPreview";
 import { buildMediaFilename, saveUrlAsFile } from "../utils/mediaDownload";
 import { A2UIRenderer } from "./A2UIRenderer";
 import { getRoomAIRequestSettings } from "../utils/aiRequestSettings";
+import { CocoToolMessage } from './CocoToolMessage';
 
 interface MessageItemProps {
   message: Message;
+  pairedToolResult?: Message;
   roomPermissions: RoomPermissions | null;
   onStartEdit: (messageId: string) => void;
   onDeleteMessage: (messageId: string) => void;
@@ -119,6 +121,20 @@ const getPlayableMediaKind = (mediaAsset?: MessageMediaAsset) => {
     : undefined;
 };
 
+const useDeferredMediaCacheFetchKey = (resetKey: string | null) => {
+  const [cacheBodyFetchKey, setCacheBodyFetchKey] = React.useState<number | null>(null);
+
+  React.useEffect(() => {
+    setCacheBodyFetchKey(null);
+  }, [resetKey]);
+
+  const markMediaLoadedForCache = React.useCallback(() => {
+    setCacheBodyFetchKey(value => (value ?? 0) + 1);
+  }, []);
+
+  return { cacheBodyFetchKey, markMediaLoadedForCache };
+};
+
 const ReplyReference: React.FC<{
   replyTo: ReplyReferenceValue;
   roomId: string;
@@ -132,12 +148,14 @@ const ReplyReference: React.FC<{
   const replySenderName = replyTo.username
     || (replyTo.messageType === "ai" ? t("aiAssistantName") : t("participant"));
   const fallbackPreview = getReplyMediaLabel(replyTo, t);
+  const { cacheBodyFetchKey, markMediaLoadedForCache } = useDeferredMediaCacheFetchKey(signedUrl);
   const { mediaUrl: displayMediaUrl, posterUrl } = useCachedMedia({
     assetId: mediaAsset?.id,
     url: signedUrl,
     kind: playableMediaKind,
     mimeType: mediaAsset?.mimeType,
     byteSize: mediaAsset?.byteSize,
+    cacheBodyFetchKey,
   });
 
   React.useEffect(() => {
@@ -176,7 +194,9 @@ const ReplyReference: React.FC<{
         <img
           src={displayMediaUrl}
           alt={t("sharedImage")}
+          crossOrigin="anonymous"
           className="mt-1 block max-h-32 max-w-full rounded-md bg-black/5 object-contain dark:bg-white/5"
+          onLoad={markMediaLoadedForCache}
           onError={() => setMediaError(true)}
         />
       );
@@ -186,9 +206,11 @@ const ReplyReference: React.FC<{
           controls
           src={displayMediaUrl}
           poster={posterUrl || undefined}
+          crossOrigin="anonymous"
           className="mt-1 block max-h-44 max-w-full rounded-md bg-black"
           preload="metadata"
           playsInline
+          onLoadedData={markMediaLoadedForCache}
           onError={() => setMediaError(true)}
         />
       );
@@ -197,7 +219,9 @@ const ReplyReference: React.FC<{
         <audio
           controls
           src={displayMediaUrl}
+          crossOrigin="anonymous"
           className="roomtalk-audio-player mt-1 block h-8 min-w-[160px] max-w-full"
+          onCanPlay={markMediaLoadedForCache}
           onError={() => setMediaError(true)}
         />
       );
@@ -214,13 +238,15 @@ const ReplyReference: React.FC<{
 
 const MessageItemComponent: React.FC<MessageItemProps> = ({
   message,
+  pairedToolResult,
   roomPermissions,
   onStartEdit,
   onDeleteMessage,
   onRefreshAI,
   onReply,
 }) => {
-  const isMine = message.clientId === clientId;
+  const isAI = message.messageType === 'ai' || message.clientId === 'ai_assistant';
+  const isMine = !isAI && message.clientId === clientId;
   const isTouchDevice = useIsTouchDevice();
   const [mediaError, setMediaError] = React.useState(false);
   const [videoPreviewError, setVideoPreviewError] = React.useState(false);
@@ -237,10 +263,10 @@ const MessageItemComponent: React.FC<MessageItemProps> = ({
   const isVideo = isMedia && mediaKind === "video";
   const isFile = isMedia && mediaKind === "file";
   const isSticker = message.messageType === "sticker";
+  const isCocoEvent = message.messageType === 'tool_call' || message.messageType === 'tool_result' || message.messageType === 'sandbox_status';
   const stickerUrl = useStickerUrl(isSticker ? message.content : undefined);
   const stickerName = useStickerName(isSticker ? message.content : undefined);
   const isText = message.messageType === "text";
-  const isAI = message.clientId === 'ai_assistant';
   const isStreaming = isAI && message.status === 'streaming';
   const isPending = message.deliveryStatus === 'pending';
   const isFailed = message.deliveryStatus === 'failed';
@@ -431,12 +457,14 @@ const MessageItemComponent: React.FC<MessageItemProps> = ({
   };
 
   const canOpenMediaViewer = Boolean(signedMediaUrl && !mediaError && (isImage || isVideo));
+  const { cacheBodyFetchKey, markMediaLoadedForCache } = useDeferredMediaCacheFetchKey(signedMediaUrl);
   const { mediaUrl: displayMediaUrl, posterUrl: videoPosterUrl } = useCachedMedia({
     assetId: message.mediaAsset?.id,
     url: signedMediaUrl,
     kind: isImage ? "image" : isAudio ? "audio" : isVideo ? "video" : undefined,
     mimeType: message.mediaAsset?.mimeType,
     byteSize: message.mediaAsset?.byteSize,
+    cacheBodyFetchKey,
   });
   const videoPreviewUrl = displayMediaUrl && isVideo ? getVideoPreviewUrl(displayMediaUrl) : null;
 
@@ -550,7 +578,9 @@ const MessageItemComponent: React.FC<MessageItemProps> = ({
             <img
               src={displayMediaUrl}
               alt={t('sharedImage')}
+              crossOrigin="anonymous"
               className="block max-h-[300px] max-w-full object-contain"
+              onLoad={markMediaLoadedForCache}
               onError={handleMediaError}
             />
           </button>
@@ -562,7 +592,9 @@ const MessageItemComponent: React.FC<MessageItemProps> = ({
           <audio
             controls
             src={displayMediaUrl}
+            crossOrigin="anonymous"
             className="roomtalk-audio-player block h-9 min-w-[180px] max-w-[240px]"
+            onCanPlay={markMediaLoadedForCache}
             onError={handleMediaError}
           />
           {audioTranscriptionContent}
@@ -617,10 +649,12 @@ const MessageItemComponent: React.FC<MessageItemProps> = ({
             <video
               src={videoPreviewUrl || displayMediaUrl}
               poster={videoPosterUrl || undefined}
+              crossOrigin="anonymous"
               className="pointer-events-none block max-h-[360px] max-w-full object-contain"
               preload="metadata"
               muted
               playsInline
+              onLoadedData={markMediaLoadedForCache}
               onError={handleVideoPreviewError}
             />
             <span className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/10 transition group-hover/video:bg-black/20">
@@ -686,6 +720,28 @@ const MessageItemComponent: React.FC<MessageItemProps> = ({
     }
     return "default";
   };
+
+  if (isCocoEvent) {
+    return (
+      <div
+        data-testid="message-item"
+        data-message-id={message.id}
+        className="group mb-1 flex w-full items-start justify-start"
+      >
+        <Avatar
+          icon={<Icon icon="lucide:bot" />}
+          color="secondary"
+          size="sm"
+          classNames={{
+            base: "mr-2 flex-shrink-0 bg-[#e8e6dc] text-[#4d4c48] dark:bg-[#30302e] dark:text-[#faf9f5] invisible",
+          }}
+        />
+        <div className="flex max-w-[82%] flex-col min-w-0 sm:max-w-[70%] items-start">
+          <CocoToolMessage message={message} pairedResult={pairedToolResult} />
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div

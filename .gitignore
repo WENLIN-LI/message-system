@@ -5,6 +5,8 @@ node_modules/
 
 # Testing
 coverage/
+__pycache__/
+*.py[cod]
 client-heroui/test-results/
 client-heroui/playwright-report/
 client-heroui/blob-report/
@@ -29,6 +31,7 @@ __pycache__/
 
 # Misc
 .DS_Store
+.claude/
 .env
 .env.local
 .env.development.local

@@ -22,10 +22,13 @@ import {
   truncateBeforeMessage,
 } from '../utils/messageState';
 import { useRoomMessageEvents } from '../hooks/useRoomMessageEvents';
+import { CodeAgentMode } from '../utils/codeAgent';
+import { CodeAgentWorkspaceSnapshot, loadCodeAgentWorkspaceSnapshot } from '../utils/cocoWorkspace';
 
 // Import your new modals
 import { DeleteConfirmationModal } from './DeleteConfirmationModal';
 import { EditMessageModal } from './EditMessageModal';
+import { CodeAgentWorkspacePanel } from './CodeAgentWorkspacePanel';
 
 const LOAD_MORE_MESSAGE_COUNT = 80;
 
@@ -35,11 +38,14 @@ const LOAD_MORE_MESSAGE_COUNT = 80;
 
 interface MessageListProps {
   roomId: string;
-  room?: Pick<Room, 'id' | 'name'>;
-  onReply: (message: Message) => void;
-  roomPermissions: RoomPermissions | null;
+  room?: Room;
+  onReply?: (message: Message) => void;
+  roomPermissions?: RoomPermissions | null;
   bottomInsetPx?: number;
   onScrollButtonVisibilityChange?: (isVisible: boolean) => void;
+  presentation?: 'chat' | 'code-agent';
+  currentRoom?: Room;
+  codeAgentMode?: CodeAgentMode;
 }
 
 export interface MessageListHandle {
@@ -52,10 +58,13 @@ export interface MessageListHandle {
 export const MessageList = React.forwardRef<MessageListHandle, MessageListProps>(({
   roomId,
   room,
-  onReply,
-  roomPermissions,
+  onReply = () => {},
+  roomPermissions = null,
   bottomInsetPx = 16,
   onScrollButtonVisibilityChange,
+  presentation = 'chat',
+  currentRoom,
+  codeAgentMode = 'plan',
 }, ref) => {
   const { t } = useTranslation();
   // generate a stable ID for the scroll container
@@ -65,7 +74,7 @@ export const MessageList = React.forwardRef<MessageListHandle, MessageListProps>
   // parent so these run per room).
   const [messages, setMessages] = useState<Message[]>(() => {
     const cached = readMemoryRoomMessageWindow(roomId);
-    return cached ? sortMessages(cached.messages.filter(msg => msg.roomId === roomId)) : [];
+    return cached ? cached.messages.filter(msg => msg.roomId === roomId) : [];
   });
   const [isLoading, setIsLoading] = useState(() => !readMemoryRoomMessageWindow(roomId));
   const [isLoadingMore, setIsLoadingMore] = useState(false);
@@ -82,6 +91,7 @@ export const MessageList = React.forwardRef<MessageListHandle, MessageListProps>
   const isNearBottomRef = useRef(true);
   const preserveScrollRef = useRef<{ scrollHeight: number; scrollTop: number } | null>(null);
   const pendingScrollFrameRef = useRef<number | null>(null);
+  const workspaceFetchAbortRef = useRef<AbortController | null>(null);
   const [showScrollButton, setShowScrollButton] = useState(false);
   // State for modals
   const [isDeleteModalOpen, setIsDeleteModalOpen] = useState(false);
@@ -89,6 +99,33 @@ export const MessageList = React.forwardRef<MessageListHandle, MessageListProps>
   const [isEditModalOpen, setIsEditModalOpen] = useState(false);
   const [messageToEdit, setMessageToEdit] = useState<Message | null>(null);
   const [sessionCostUsd, setSessionCostUsd] = useState<number | null>(null);
+  const [workspaceSnapshot, setWorkspaceSnapshot] = useState<CodeAgentWorkspaceSnapshot | null>(null);
+  const [isWorkspaceRefreshing, setIsWorkspaceRefreshing] = useState(false);
+  const [workspaceRefreshError, setWorkspaceRefreshError] = useState<string | null>(null);
+  const codeAgentRoom = currentRoom || (presentation === 'code-agent' ? room : undefined);
+  const currentRoomId = codeAgentRoom?.id;
+  const getAIRequestSettingsForRoom = useCallback(() => ({
+    ...getRoomAIRequestSettings(roomId),
+    ...(presentation === 'code-agent' ? { codeAgentMode } : {}),
+  }), [roomId, presentation, codeAgentMode]);
+
+  const toolResultPairing = React.useMemo(() => {
+    const resultByCallId = new Map<string, Message>();
+    const consumed = new Set<string>();
+    const callIds = new Set<string>();
+    for (const msg of messages) {
+      if (msg.messageType === 'tool_call' && msg.toolCallId) {
+        callIds.add(msg.toolCallId);
+      }
+    }
+    for (const msg of messages) {
+      if (msg.messageType === 'tool_result' && msg.toolCallId && callIds.has(msg.toolCallId)) {
+        resultByCallId.set(msg.toolCallId, msg);
+        consumed.add(msg.id);
+      }
+    }
+    return { resultByCallId, consumed };
+  }, [messages]);
 
   const updateMessages = useCallback((updater: React.SetStateAction<Message[]>) => {
     setMessages(prev => {
@@ -123,7 +160,8 @@ export const MessageList = React.forwardRef<MessageListHandle, MessageListProps>
       return;
     }
 
-    messagesEndRef.current?.scrollIntoView({ behavior });
+    // Intentionally avoid scrollIntoView here: it can scroll outer layout
+    // ancestors and push the code workspace summary out of view.
   }, []);
 
   const scheduleScrollToBottom = useCallback((behavior: ScrollBehavior = 'auto') => {
@@ -189,8 +227,52 @@ export const MessageList = React.forwardRef<MessageListHandle, MessageListProps>
       if (pendingScrollFrameRef.current !== null && typeof cancelAnimationFrame === 'function') {
         cancelAnimationFrame(pendingScrollFrameRef.current);
       }
+      workspaceFetchAbortRef.current?.abort();
     };
   }, []);
+
+  const refreshWorkspaceSnapshot = useCallback(async () => {
+    if (presentation !== 'code-agent' || !currentRoomId) {
+      return;
+    }
+
+    workspaceFetchAbortRef.current?.abort();
+    const controller = new AbortController();
+    workspaceFetchAbortRef.current = controller;
+    setIsWorkspaceRefreshing(true);
+    setWorkspaceRefreshError(null);
+
+    try {
+      const snapshot = await loadCodeAgentWorkspaceSnapshot(currentRoomId, { signal: controller.signal });
+      if (!controller.signal.aborted) {
+        setWorkspaceSnapshot(snapshot);
+      }
+    } catch (error) {
+      if (!controller.signal.aborted) {
+        console.error('Failed to refresh code-agent workspace snapshot:', error);
+        setWorkspaceRefreshError(error instanceof Error ? error.message : 'Failed to load workspace snapshot');
+      }
+    } finally {
+      if (workspaceFetchAbortRef.current === controller) {
+        workspaceFetchAbortRef.current = null;
+        setIsWorkspaceRefreshing(false);
+      }
+    }
+  }, [currentRoomId, presentation]);
+
+  useEffect(() => {
+    if (presentation !== 'code-agent' || !currentRoomId) {
+      setWorkspaceSnapshot(null);
+      setWorkspaceRefreshError(null);
+      return;
+    }
+
+    void refreshWorkspaceSnapshot();
+
+    return () => {
+      workspaceFetchAbortRef.current?.abort();
+    };
+  }, [currentRoomId, presentation, refreshWorkspaceSnapshot]);
 
   // Warm the lazily-loaded markdown chunk on mount so the first message renders
   // as markdown immediately instead of flashing plain text. The component
@@ -306,13 +388,13 @@ export const MessageList = React.forwardRef<MessageListHandle, MessageListProps>
       roomId,
       messageId,
       newContent,
-      ...getRoomAIRequestSettings(roomId),
+      ...getAIRequestSettingsForRoom(),
     }).catch((error) => {
       console.error('Failed to save edit before asking AI:', error);
       updateMessages(originalMessages);
       alert(t('errorEditingMessage', { error: error instanceof Error ? error.message : t('unknownError') }));
     });
-  }, [roomId, messages, updateMessages, t]);
+  }, [roomId, messages, updateMessages, getAIRequestSettingsForRoom, t]);
 
   // Define handleConfirmDelete within useCallback, accessing messageToDelete state
   const handleConfirmDelete = useCallback(() => {
@@ -359,7 +441,7 @@ export const MessageList = React.forwardRef<MessageListHandle, MessageListProps>
       roomId,
       // prompt: '', // Prompt is now determined by the server based on truncated history
       retryForMessageId: messageId, // 新增：告知服务器这是针对哪条消息的重试
-      ...getRoomAIRequestSettings(roomId),
+      ...getAIRequestSettingsForRoom(),
     }).catch((error) => {
       console.error('Failed to retry AI response:', error);
       socket.emit('get_room_messages', { roomId });
@@ -374,7 +456,7 @@ export const MessageList = React.forwardRef<MessageListHandle, MessageListProps>
       scrollToBottom('smooth');
       retryScrollTimerRef.current = null;
     }, 100);
-  }, [roomId, updateMessages, scrollToBottom]);
+  }, [roomId, updateMessages, scrollToBottom, getAIRequestSettingsForRoom]);
 
   useRoomMessageEvents({
     roomId,
@@ -449,6 +531,7 @@ export const MessageList = React.forwardRef<MessageListHandle, MessageListProps>
 
   return (
     <>
+      {presentation !== 'code-agent' && (
       <div className="absolute right-3 top-3 z-20">
         <div className="flex items-center gap-1.5">
           <Dropdown placement="bottom-end">
@@ -479,60 +562,86 @@ export const MessageList = React.forwardRef<MessageListHandle, MessageListProps>
           </div>
         </div>
       </div>
+      )}
       <div
-        id={scrollContainerId}
-        data-testid="message-list-scroll"
-        ref={containerRef}
-        className="relative flex h-full w-full flex-col overflow-y-auto bg-[#f5f4ed] px-3 pt-3 dark:bg-[#141413]"
-        onScroll={handleScroll}
+        data-testid="message-list-shell"
+        className="flex h-full min-h-0 w-full flex-col overflow-hidden bg-[#f5f4ed] dark:bg-[#141413]"
       >
-        <div ref={contentRef} data-testid="message-list-content" className="flex min-h-full flex-col">
-          {hasMoreMessages && (
-            <div className="mb-3 flex justify-center">
-              <button
-                type="button"
-                onClick={handleLoadMore}
-                disabled={isLoadingMore}
-                className="rounded-full border border-[#dedbd0] bg-[#faf9f5]/95 px-3 py-1.5 text-xs font-medium text-[#4d4c48] shadow-sm backdrop-blur transition hover:border-[#c2c0b6] hover:text-[#141413] dark:border-[#30302e] dark:bg-[#1d1d1b]/95 dark:text-[#e8e6dc] dark:hover:text-[#faf9f5]"
-              >
-                {isLoadingMore ? t('loadingMore') : t('loadMoreMessages', { count: LOAD_MORE_MESSAGE_COUNT })}
-              </button>
-            </div>
-          )}
-          {isLoading && messages.length === 0 && (
-            <div className="flex min-h-[220px] flex-1 items-center justify-center">
-              <Icon icon="lucide:loader-circle" className="h-6 w-6 animate-spin text-[#c96442] dark:text-[#d97757]" />
-            </div>
-          )}
-          {!isLoading && messages.length === 0 && (
-            <div className="flex min-h-[220px] flex-1 flex-col items-center justify-center text-center">
-              <Icon icon="lucide:message-circle" className="mb-3 h-8 w-8 text-[#87867f] dark:text-[#8f8d86]" />
-              <p className="font-serif text-lg font-medium text-[#141413] dark:text-[#faf9f5]">{t('noMessages')}</p>
-              <p className="mt-1 text-sm text-[#5e5d59] dark:text-[#b0aea5]">{t('beFirstToMessage')}</p>
-            </div>
-          )}
-          {!isLoading && messages.length > 0 && (
-            <div className="flex flex-col space-y-2">
-              {messages.map((message) => (
-                <MessageItem
-                  key={message.id}
-                  message={message}
-                  roomPermissions={roomPermissions}
-                  onStartEdit={handleOpenEditModal}
-                  onDeleteMessage={handleOpenDeleteModal}
-                  onRefreshAI={handleRefreshAI}
-                  onReply={onReply}
-                />
-              ))}
-            </div>
-          )}
-          <div
-            aria-hidden="true"
-            data-testid="message-list-scroll-end-inset"
-            className="flex-shrink-0"
-            style={{ height: bottomInsetPx }}
+        {presentation === 'code-agent' && codeAgentRoom && (
+          <CodeAgentWorkspacePanel
+            room={codeAgentRoom}
+            messages={messages}
+            mode={codeAgentMode}
+            sessionCostUsd={sessionCostUsd ?? 0}
+            workspaceSnapshot={workspaceSnapshot}
+            isRefreshingWorkspace={isWorkspaceRefreshing}
+            workspaceRefreshError={workspaceRefreshError}
+            onRefreshWorkspace={refreshWorkspaceSnapshot}
           />
-          <div ref={messagesEndRef} />
+        )}
+        <div
+          id={scrollContainerId}
+          data-testid="message-list-scroll"
+          ref={containerRef}
+          className="relative flex min-h-0 w-full flex-1 flex-col overflow-y-auto px-3 pt-3"
+          onScroll={handleScroll}
+        >
+          <div ref={contentRef} data-testid="message-list-content" className="flex min-h-full flex-col">
+            {hasMoreMessages && (
+              <div className="mb-3 flex justify-center">
+                <button
+                  type="button"
+                  onClick={handleLoadMore}
+                  disabled={isLoadingMore}
+                  className="rounded-full border border-[#dedbd0] bg-[#faf9f5]/95 px-3 py-1.5 text-xs font-medium text-[#4d4c48] shadow-sm backdrop-blur transition hover:border-[#c2c0b6] hover:text-[#141413] dark:border-[#30302e] dark:bg-[#1d1d1b]/95 dark:text-[#e8e6dc] dark:hover:text-[#faf9f5]"
+                >
+                  {isLoadingMore ? t('loadingMore') : t('loadMoreMessages', { count: LOAD_MORE_MESSAGE_COUNT })}
+                </button>
+              </div>
+            )}
+            {isLoading && messages.length === 0 && (
+              <div className="flex min-h-[220px] flex-1 items-center justify-center">
+                <Icon icon="lucide:loader-circle" className="h-6 w-6 animate-spin text-[#c96442] dark:text-[#d97757]" />
+              </div>
+            )}
+            {!isLoading && messages.length === 0 && (
+              <div className="flex min-h-[220px] flex-1 flex-col items-center justify-center text-center">
+                <Icon icon="lucide:message-circle" className="mb-3 h-8 w-8 text-[#87867f] dark:text-[#8f8d86]" />
+                <p className="font-serif text-lg font-medium text-[#141413] dark:text-[#faf9f5]">{t('noMessages')}</p>
+                <p className="mt-1 text-sm text-[#5e5d59] dark:text-[#b0aea5]">{t('beFirstToMessage')}</p>
+              </div>
+            )}
+            {!isLoading && messages.length > 0 && (
+              <div className="flex flex-col space-y-2">
+                {messages.map((message) => {
+                  if (message.messageType === 'tool_result' && toolResultPairing.consumed.has(message.id)) {
+                    return null;
+                  }
+                  return (
+                    <MessageItem
+                      key={message.id}
+                      message={message}
+                      pairedToolResult={message.messageType === 'tool_call' && message.toolCallId
+                        ? toolResultPairing.resultByCallId.get(message.toolCallId)
+                        : undefined}
+                      roomPermissions={roomPermissions}
+                      onStartEdit={handleOpenEditModal}
+                      onDeleteMessage={handleOpenDeleteModal}
+                      onRefreshAI={handleRefreshAI}
+                      onReply={onReply}
+                    />
+                  );
+                })}
+              </div>
+            )}
+            <div
+              aria-hidden="true"
+              data-testid="message-list-scroll-end-inset"
+              className="flex-shrink-0"
+              style={{ height: bottomInsetPx }}
+            />
+            <div ref={messagesEndRef} />
+          </div>
         </div>
       </div>
 

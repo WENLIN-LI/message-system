@@ -47,6 +47,7 @@ import {
   isConfirmingIMEComposition,
 } from '../utils/keyboardComposition';
 import { Message, RoomPostingSchedule } from '../utils/types';
+import { CodeAgentMode } from '../utils/codeAgent';
 
 interface MessageInputProps {
   roomId: string;
@@ -62,6 +63,11 @@ interface MessageInputProps {
   canPost?: boolean;
   postingRestrictionReason?: string;
   postingSchedule?: RoomPostingSchedule;
+  isRoomAIProcessing?: boolean;
+  isCodeAgentRoom?: boolean;
+  codeAgentMode?: CodeAgentMode;
+  codeAgentMaxMode?: CodeAgentMode;
+  onCodeAgentModeChange?: (mode: CodeAgentMode) => void;
 }
 
 // 使用WeakMap存储图片元素和对应的File对象
@@ -74,6 +80,14 @@ const createClientMessageId = () => {
 
   return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 };
+
+const isMacPlatform = (platform: string) => (
+  platform.startsWith('Mac') || platform === 'iPhone' || platform === 'iPad' || platform === 'iPod'
+);
+
+const detectMacOS = () => (
+  typeof navigator !== 'undefined' && isMacPlatform(navigator.platform || '')
+);
 
 const getErrorMessage = (error: unknown, fallback: string) => (
   error instanceof Error ? error.message : fallback
@@ -139,6 +153,11 @@ export const MessageInput: React.FC<MessageInputProps> = ({
   onOptimisticMessageFailed,
   canPost = true,
   postingSchedule,
+  isRoomAIProcessing = false,
+  isCodeAgentRoom = false,
+  codeAgentMode = 'plan',
+  codeAgentMaxMode = 'plan',
+  onCodeAgentModeChange,
 }) => {
   const { t } = useTranslation();
   const [_contentItems, setContentItems] = useState<MessageContentItem[]>(emptyMessageContent());
@@ -157,6 +176,7 @@ export const MessageInput: React.FC<MessageInputProps> = ({
   const isComposingRef = useRef(false);
   const lastCompositionEndAtRef = useRef(0);
   const [isAiProcessing, setIsAiProcessing] = useState(false); // 新增: 跟踪 AI 处理状态
+  const isAIInputLocked = isAiProcessing || isRoomAIProcessing;
 
   // Voice recording state
   const [isVoiceMode, setIsVoiceMode] = useState(false);
@@ -185,7 +205,7 @@ export const MessageInput: React.FC<MessageInputProps> = ({
   // 检测是否为移动设备
   const [_isMobile, setIsMobile] = useState(false);
   // 检测操作系统类型
-  const [isMacOS, setIsMacOS] = useState(false);
+  const [isMacOS, setIsMacOS] = useState(() => detectMacOS());
 
   // 检测设备和操作系统类型
   useEffect(() => {
@@ -195,13 +215,8 @@ export const MessageInput: React.FC<MessageInputProps> = ({
       return /android|webos|iphone|ipad|ipod|blackberry|iemobile|opera mini/i.test(userAgent.toLowerCase());
     };
 
-    // 检测 macOS
-    const checkMacOS = () => {
-      return navigator.platform.toLowerCase().includes('mac');
-    };
-
     setIsMobile(checkMobile());
-    setIsMacOS(checkMacOS());
+    setIsMacOS(detectMacOS());
   }, []);
 
   const {
@@ -226,6 +241,7 @@ export const MessageInput: React.FC<MessageInputProps> = ({
   // 新增角色设置模态框的状态
   const { isOpen: isAISettingsOpen, onOpen: onAISettingsOpen, onClose: onAISettingsClose } = useDisclosure();
   const postingClosedMessage = t('postingClosed');
+  const selectedCodeAgentMode = codeAgentMaxMode === 'acceptEdits' ? codeAgentMode : 'plan';
 
   const handleAIContextMessageLimitChange = useCallback((limit: number) => {
     const normalizedLimit = normalizeAIContextMessageLimit(limit);
@@ -476,7 +492,7 @@ export const MessageInput: React.FC<MessageInputProps> = ({
 
     const latestContentItems = parseEditorContent();
 
-    if (isSending || isAiProcessing) return;
+    if (isSending || isAIInputLocked) return;
 
     let optimisticClientMessageId: string | null = null;
     setIsAiProcessing(true);
@@ -489,8 +505,12 @@ export const MessageInput: React.FC<MessageInputProps> = ({
       if (!prompt) {
         await requestAIResponse({
           roomId,
-          systemPrompt: selectedRole.systemPrompt,
-          roleName: selectedRole.name,
+          ...(!isCodeAgentRoom ? {
+            systemPrompt: selectedRole.systemPrompt,
+            roleName: selectedRole.name,
+          } : {
+            codeAgentMode: selectedCodeAgentMode,
+          }),
           model: selectedAIModel || defaultAIModel,
           maxContextMessages: aiContextMessageLimit,
         });
@@ -510,8 +530,12 @@ export const MessageInput: React.FC<MessageInputProps> = ({
         avatar,
         replyToMessageId: replyToMessage?.id,
         clientMessageId,
-        systemPrompt: selectedRole.systemPrompt,
-        roleName: selectedRole.name,
+        ...(!isCodeAgentRoom ? {
+          systemPrompt: selectedRole.systemPrompt,
+          roleName: selectedRole.name,
+        } : {
+          codeAgentMode: selectedCodeAgentMode,
+        }),
         model: selectedAIModel || defaultAIModel,
         maxContextMessages: aiContextMessageLimit,
       });
@@ -544,7 +568,7 @@ export const MessageInput: React.FC<MessageInputProps> = ({
     // Parse latest content (might be redundant if useEffect handles it well)
     const latestContentItems = parseEditorContent();
 
-    if (!hasMessageContent(latestContentItems) || isSending || isAiProcessing) return;
+    if (!hasMessageContent(latestContentItems) || isSending || isAIInputLocked) return;
 
     const avatar = { text: avatarText, color: avatarColor };
     const outgoingItems = buildOutgoingMessageItems(latestContentItems);
@@ -957,7 +981,7 @@ export const MessageInput: React.FC<MessageInputProps> = ({
       return;
     }
 
-    if (isSending || isAiProcessing) return;
+    if (isSending || isAIInputLocked) return;
 
     setIsSending(true);
     try {
@@ -988,7 +1012,7 @@ export const MessageInput: React.FC<MessageInputProps> = ({
       return;
     }
 
-    if (isSending || isAiProcessing) return;
+    if (isSending || isAIInputLocked) return;
 
     if (file.size > MAX_FILE_UPLOAD_BYTES) {
       setErrorMessage(t('fileTooLarge'));
@@ -1243,23 +1267,40 @@ export const MessageInput: React.FC<MessageInputProps> = ({
 
   // 处理回车事件
   const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter') {
-      if (isConfirmingIMEComposition(getKeyboardCompositionSnapshot(
+    const isEnterKey = e.key === 'Enter' || e.code === 'NumpadEnter';
+    if (isEnterKey) {
+      const compositionSnapshot = getKeyboardCompositionSnapshot(
         e,
         isComposingRef.current,
         lastCompositionEndAtRef.current
-      ))) {
+      );
+      const isAIShortcut = !e.shiftKey && (isMacOS ? e.metaKey : e.ctrlKey);
+
+      if (isAIShortcut) {
+        if (
+          compositionSnapshot.isComposing ||
+          compositionSnapshot.nativeIsComposing ||
+          compositionSnapshot.keyCode === 229
+        ) {
+          return;
+        }
+
+        e.preventDefault();
+        handleAskAI();
+        return;
+      }
+
+      if (isConfirmingIMEComposition(compositionSnapshot)) {
+        return;
+      }
+
+      if (e.altKey || e.metaKey || e.ctrlKey) {
         return;
       }
 
       // Shift+Enter: 默认行为（换行）
       if (e.shiftKey) {
         return; // 允许默认的换行行为
-      }
-      // Mac用Command+Enter, Windows用Ctrl+Enter: 询问AI
-      else if ((isMacOS && e.metaKey) || (!isMacOS && e.ctrlKey)) {
-        e.preventDefault();
-        handleAskAI();
       }
       // 单独Enter: 发送消息
       else {
@@ -1480,14 +1521,14 @@ export const MessageInput: React.FC<MessageInputProps> = ({
             /* ===== Text mode: normal editor ===== */
             <div
               className="min-h-7 max-h-28 min-w-0 flex-1 overflow-y-auto px-2 py-0.5 text-base leading-5 text-[#141413] dark:text-[#faf9f5] sm:min-h-16 sm:max-h-36 sm:w-full sm:flex-none sm:px-4 sm:pb-2 sm:pt-4 sm:text-sm"
-              contentEditable={!isSending && !isAiProcessing && canPost}
+              contentEditable={!isSending && !isAIInputLocked && canPost}
               onInput={parseEditorContent}
               onPaste={handlePaste}
               onKeyDown={handleKeyDown}
               onCompositionStart={handleCompositionStart}
               onCompositionEnd={handleCompositionEnd}
               ref={editorRef}
-              data-placeholder={isAiProcessing ? t('aiProcessing') : ''}
+              data-placeholder={isAIInputLocked ? t('aiProcessing') : ''}
               style={{ lineHeight: '1.35', whiteSpace: 'pre-wrap' }}
               role="textbox"
               data-testid="message-editor"
@@ -1506,7 +1547,7 @@ export const MessageInput: React.FC<MessageInputProps> = ({
               aria-label={isVoiceMode ? t('keyboardInput') : t('voiceInput')}
               className="h-7 w-7 min-w-7 rounded-full text-[#5e5d59] dark:text-[#b0aea5] sm:h-9 sm:w-9 sm:min-w-9"
               onPress={handleToggleVoiceMode}
-              isDisabled={isSending || isAiProcessing || !canPost}
+              isDisabled={isSending || isAIInputLocked || !canPost}
             >
               <Icon icon={isVoiceMode ? 'lucide:keyboard' : 'lucide:mic'} className="h-3.5 w-3.5 sm:h-5 sm:w-5" />
             </Button>
@@ -1521,7 +1562,7 @@ export const MessageInput: React.FC<MessageInputProps> = ({
                   aria-label={t('uploadMedia')}
                   className="h-7 w-7 min-w-7 rounded-full text-[#5e5d59] dark:text-[#b0aea5] sm:h-9 sm:w-9 sm:min-w-9"
                   onPress={() => fileInputRef.current?.click()}
-                  isDisabled={isSending || isAiProcessing || !canPost}
+                  isDisabled={isSending || isAIInputLocked || !canPost}
                 >
                   <Icon icon="lucide:image-plus" className="h-3.5 w-3.5 sm:h-5 sm:w-5" />
                 </Button>
@@ -1540,7 +1581,7 @@ export const MessageInput: React.FC<MessageInputProps> = ({
                       variant="light"
                       aria-label={t('stickers')}
                       className="h-7 w-7 min-w-7 rounded-full text-[#5e5d59] dark:text-[#b0aea5] sm:h-9 sm:w-9 sm:min-w-9"
-                      isDisabled={isSending || isAiProcessing || !canPost}
+                      isDisabled={isSending || isAIInputLocked || !canPost}
                     >
                       <Icon icon="lucide:smile" className="h-3.5 w-3.5 sm:h-5 sm:w-5" />
                     </Button>
@@ -1557,7 +1598,7 @@ export const MessageInput: React.FC<MessageInputProps> = ({
                   aria-label={t('attachFile')}
                   className="h-7 w-7 min-w-7 rounded-full text-[#5e5d59] dark:text-[#b0aea5] sm:h-9 sm:w-9 sm:min-w-9"
                   onPress={() => arbitraryFileInputRef.current?.click()}
-                  isDisabled={isSending || isAiProcessing || !canPost}
+                  isDisabled={isSending || isAIInputLocked || !canPost}
                 >
                   <Icon icon="lucide:paperclip" className="h-3.5 w-3.5 sm:h-5 sm:w-5" />
                 </Button>
@@ -1565,7 +1606,7 @@ export const MessageInput: React.FC<MessageInputProps> = ({
                 {/* AI设置按钮 */}
                 <MessageInputAISettingsButton
                   onOpen={onAISettingsOpen}
-                  isDisabled={isSending || isAiProcessing}
+                  isDisabled={isSending || isAIInputLocked}
                 />
               </>
             )}
@@ -1579,7 +1620,7 @@ export const MessageInput: React.FC<MessageInputProps> = ({
               accept="image/*,video/*,.m4v,.mov,.mp4,.qt,.webm"
               multiple={true}
               onChange={handleImageUpload}
-              disabled={isSending || isAiProcessing || !canPost}
+              disabled={isSending || isAIInputLocked || !canPost}
             />
 
             <input
@@ -1589,7 +1630,7 @@ export const MessageInput: React.FC<MessageInputProps> = ({
               className="hidden"
               multiple={true}
               onChange={handleArbitraryFileUpload}
-              disabled={isSending || isAiProcessing || !canPost}
+              disabled={isSending || isAIInputLocked || !canPost}
             />
 
             {/* AI角色选择和发送按钮区 (text mode only) */}
@@ -1603,6 +1644,7 @@ export const MessageInput: React.FC<MessageInputProps> = ({
                 defaultAIModel={defaultAIModel}
                 isSending={isSending}
                 isAiProcessing={isAiProcessing}
+                isInputLocked={isAIInputLocked}
                 canPost={canPost}
                 isMacOS={isMacOS}
                 currentInputText={currentInputText}
@@ -1618,6 +1660,10 @@ export const MessageInput: React.FC<MessageInputProps> = ({
                 onDeleteRole={handleDeleteRole}
                 onAskAI={handleAskAI}
                 onSend={handleSubmit}
+                isCodeAgentRoom={isCodeAgentRoom}
+                codeAgentMode={selectedCodeAgentMode}
+                codeAgentMaxMode={codeAgentMaxMode}
+                onCodeAgentModeChange={onCodeAgentModeChange}
               />
             )}
           </div>

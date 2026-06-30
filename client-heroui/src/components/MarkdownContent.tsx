@@ -61,6 +61,10 @@ const fixQuoteBlocks = (content: string): string => {
   return result.join("\n");
 };
 
+function escapeRawHtmlTags(content: string): string {
+  return content.split("<").join("&lt;").split(">").join("&gt;");
+}
+
 /** 数学公式解析 */
 const parseMath = (content: string): string => {
   let text = content;
@@ -234,12 +238,14 @@ CodeBlock.displayName = "CodeBlock";
 /** 主组件 */
 export const MarkdownContent: React.FC<MarkdownContentProps> = memo(({ content, isStreaming }) => {
   const processed = React.useMemo(() => {
-    let text = preprocessMarkdown(content);
+    const text = escapeRawHtmlTags(preprocessMarkdown(content));
     return parseMath(text);
   }, [content]);
 
   const mdOptions = {
     forceBlock: true,
+    // User-authored raw HTML is escaped before this point. Raw parsing remains
+    // enabled only so our internal MathInline/MathBlock bridge can render.
     disableParsingRawHTML: false,
     overrides: {
       p: { component: ({ children }: { children: ReactNode }) => <div>{children}</div> },

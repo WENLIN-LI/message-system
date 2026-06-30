@@ -16,6 +16,7 @@ import {
   RoomPermissions,
   RoomPostingSchedule,
   RoomRoleMember,
+  RoomType,
 } from './types';
 import { Socket } from 'socket.io-client';
 
@@ -73,6 +74,16 @@ type SocketAckResponse = {
   message?: unknown;
 };
 
+type CreateRoomAckResponse = SocketAckResponse & {
+  roomId?: string;
+};
+
+export type CreateRoomOptions = {
+  password?: string;
+  postingSchedule?: RoomPostingSchedule | null;
+  type?: RoomType;
+};
+
 type SendMessageAckResponse = SocketAckResponse & {
   message?: Message;
 };
@@ -83,6 +94,12 @@ type SendMessageAndAskAIAckResponse = SocketAckResponse & {
   aiStarted?: boolean;
   aiError?: string;
 };
+
+type CodeAgentWorkspaceSnapshotAckResponse = SocketAckResponse & {
+  snapshot?: unknown;
+};
+
+type CodeAgentMode = 'plan' | 'acceptEdits';
 
 type RoomAckResponse = SocketAckResponse & {
   room?: Room;
@@ -526,7 +543,16 @@ export const leaveRoom = (roomId: string) => {
 };
 
 // Create a new room
-export const createRoom = (roomName: string, description?: string, password?: string, postingSchedule?: RoomPostingSchedule | null): Promise<string> => {
+export const createRoom = (
+  roomName: string,
+  description?: string,
+  optionsOrPassword?: CreateRoomOptions | string,
+  legacyPostingSchedule?: RoomPostingSchedule | null,
+): Promise<string> => {
+  const options: CreateRoomOptions = typeof optionsOrPassword === 'string'
+    ? { password: optionsOrPassword, postingSchedule: legacyPostingSchedule }
+    : (optionsOrPassword || {});
+
   return ensureRegisteredSocket().then(() => new Promise<string>((resolve, reject) => {
     let settled = false;
     const timeoutId = window.setTimeout(() => {
@@ -535,13 +561,24 @@ export const createRoom = (roomName: string, description?: string, password?: st
       reject(new Error('Timed out while creating room'));
     }, SEND_MESSAGE_ACK_TIMEOUT_MS);
 
-    socket.emit('create_room', { name: roomName, description, password, postingSchedule }, (response: string | SocketAckResponse) => {
+    socket.emit('create_room', {
+      name: roomName,
+      description,
+      password: options.password,
+      postingSchedule: options.postingSchedule,
+      type: options.type || 'chat',
+    }, (response: string | CreateRoomAckResponse) => {
       if (settled) return;
       settled = true;
       window.clearTimeout(timeoutId);
 
       if (typeof response === 'string' && response) {
         resolve(response);
+        return;
+      }
+
+      if (typeof response === 'object' && response?.success && response.roomId) {
+        resolve(response.roomId);
         return;
       }
 
@@ -908,10 +945,26 @@ export const requestAIResponse = (data: {
   editedMessageId?: string;
   retryForMessageId?: string;
   maxContextMessages?: number;
+  codeAgentMode?: CodeAgentMode;
 }) => {
   return emitWithAck('ask_ai', data, 'Timed out while starting AI response', 'Failed to start AI response')
     .then(() => undefined);
 };
+
+export const requestCodeAgentWorkspaceSnapshot = (roomId: string): Promise<unknown> => (
+  emitWithAck<CodeAgentWorkspaceSnapshotAckResponse>(
+    'get_code_workspace_snapshot',
+    { roomId },
+    'Timed out while refreshing workspace',
+    'Failed to refresh workspace',
+  ).then((response) => {
+    if (!response.snapshot) {
+      throw new Error('Server did not return workspace snapshot');
+    }
+
+    return response.snapshot;
+  })
+);
 
 export const sendMessageAndAskAI = (params: {
   roomId: string;
@@ -924,6 +977,7 @@ export const sendMessageAndAskAI = (params: {
   roleName?: string;
   model?: string;
   maxContextMessages?: number;
+  codeAgentMode?: CodeAgentMode;
 }): Promise<{ userMessage: Message; aiMessageId?: string; aiStarted: boolean; aiError?: string }> => {
   return emitWithAck<SendMessageAndAskAIAckResponse>(
     'send_message_and_ask_ai',
@@ -952,6 +1006,7 @@ export const requestEditMessageAndAIResponse = (data: {
   roleName?: string;
   model?: string;
   maxContextMessages?: number;
+  codeAgentMode?: CodeAgentMode;
 }) => {
   return emitWithAck('edit_message_and_ask_ai', data, 'Timed out while starting AI response', 'Failed to start AI response')
     .then(() => undefined);
@@ -962,8 +1017,9 @@ export const getMediaDownloadUrl = async (params: {
   assetId: string;
 }): Promise<{ url: string; expiresAt?: string }> => {
   const query = new URLSearchParams({ roomId: params.roomId });
+  const headers = clientAuthHeaders();
   const response = await fetch(apiPath(`/api/media/${encodeURIComponent(params.assetId)}/download-url?${query.toString()}`), {
-    headers: clientAuthHeaders(),
+    headers,
   });
   if (!response.ok) {
     throw new Error(await parseApiError(response, 'Failed to get media URL'));

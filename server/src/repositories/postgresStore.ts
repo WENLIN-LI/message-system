@@ -1,8 +1,8 @@
 import { customAlphabet } from 'nanoid';
 import { Logger } from '../logger';
-import { AICost, MediaAsset, Message, MessageMediaAsset, Room, RoomAICostTotal, RoomMember, RoomMemberRole, RoomPostingSchedule } from '../types';
+import { AICost, MediaAsset, Message, MessageMediaAsset, Room, RoomAICostTotal, RoomCocoStatus, RoomMember, RoomMemberRole, RoomPostingSchedule, RoomSandboxStatus, RoomType } from '../types';
 import { getAIStreamOwnerId, InterruptedStreamingMessageRecoveryOptions } from '../services/aiStreamRecovery';
-import { AudioTranscriptionRecord, AudioTranscriptionUpdate, ClientAccount, ClientAuthTokenRecord, CreateGoogleAccountInput, DEFAULT_ROOM_MESSAGE_PAGE_LIMIT, DurableRoomStore, GoogleAccountProfile, MediaHistoryPage, MediaHistoryPageOptions, MediaMessageAppendResult, PendingMediaUpload, PushSubscriptionRecord, RoomMessagePageOptions, RoomSettingsUpdate, SavePushSubscriptionInput } from './store';
+import { AssistantRunRecord, AssistantRunUpdate, AudioTranscriptionRecord, AudioTranscriptionUpdate, ClientAccount, ClientAuthTokenRecord, CreateGoogleAccountInput, DEFAULT_ROOM_MESSAGE_PAGE_LIMIT, DurableRoomStore, GoogleAccountProfile, MediaHistoryPage, MediaHistoryPageOptions, MediaMessageAppendResult, OutboxClaimOptions, OutboxEventRecord, OutboxFailOptions, PendingMediaUpload, PushSubscriptionRecord, RoomMessagePageOptions, RoomSettingsUpdate, SavePushSubscriptionInput } from './store';
 import { POSTGRES_MIGRATIONS, POSTGRES_SCHEMA_SQL } from './postgresSchema';
 import { MediaObjectStorage } from '../services/mediaObjectStorage';
 
@@ -34,6 +34,12 @@ type RoomRow = {
   message_version?: number | string | null;
   password_hash?: string | null;
   posting_schedule?: unknown;
+  type?: RoomType | null;
+  sandbox_id?: string | null;
+  sandbox_status?: RoomSandboxStatus | null;
+  sandbox_updated_at?: string | Date | null;
+  coco_session_id?: string | null;
+  coco_status?: RoomCocoStatus | null;
   room_version?: number | string | null;
   updated_at?: string | Date | null;
 };
@@ -50,6 +56,13 @@ type MessageRow = {
   avatar: unknown;
   mime_type: string | null;
   status: Message['status'] | null;
+  turn_id?: string | null;
+  tool_call_id?: string | null;
+  tool_name?: string | null;
+  tool_args?: unknown;
+  tool_output_preview?: string | null;
+  exit_code?: number | string | null;
+  is_error?: boolean | null;
   ai_model: unknown;
   usage: unknown;
   cost: unknown;
@@ -111,6 +124,48 @@ type AudioTranscriptionRow = {
   completed_at: string | Date | null;
 };
 
+type AssistantRunRow = {
+  id: string;
+  room_id: string;
+  requested_by_client_id: string;
+  user_message_id: string | null;
+  ai_message_id: string;
+  status: AssistantRunRecord['status'];
+  model_id: string;
+  api_model: string;
+  provider: AssistantRunRecord['provider'];
+  role_name: string | null;
+  system_prompt: string | null;
+  max_context_messages: number | string | null;
+  retry_for_message_id: string | null;
+  edited_message_id: string | null;
+  error: string | null;
+  metadata: unknown;
+  created_at: string | Date;
+  queued_at: string | Date;
+  started_at: string | Date | null;
+  completed_at: string | Date | null;
+  updated_at: string | Date;
+};
+
+type OutboxEventRow = {
+  id: string;
+  event_type: string;
+  aggregate_type: string;
+  aggregate_id: string;
+  room_id: string | null;
+  payload: unknown;
+  status: OutboxEventRecord['status'];
+  attempts: number | string;
+  available_at: string | Date;
+  locked_at: string | Date | null;
+  locked_by: string | null;
+  processed_at: string | Date | null;
+  last_error: string | null;
+  created_at: string | Date;
+  updated_at: string | Date;
+};
+
 type PushSubscriptionRow = {
   endpoint: string;
   client_id: string;
@@ -136,12 +191,15 @@ type ClientAccountRow = {
   email_verified: boolean | null;
 };
 
-const ROOM_COLUMNS = 'id, name, description, created_at, last_activity_at, creator_id, message_version, password_hash, posting_schedule, room_version, updated_at';
-const MESSAGE_COLUMNS = 'id, room_id, client_id, content, timestamp, updated_at, message_type, username, avatar, mime_type, status, ai_model, usage, cost, reply_to, ai_stream_owner_id, ui_payload';
+const ROOM_COLUMNS = 'id, name, description, created_at, last_activity_at, creator_id, message_version, password_hash, posting_schedule, type, sandbox_id, sandbox_status, sandbox_updated_at, coco_session_id, coco_status, room_version, updated_at';
+const MESSAGE_COLUMNS = 'id, room_id, client_id, content, timestamp, updated_at, message_type, username, avatar, mime_type, status, turn_id, tool_call_id, tool_name, tool_args, tool_output_preview, exit_code, is_error, ai_model, usage, cost, reply_to, ai_stream_owner_id, ui_payload';
 const ROOM_MEMBER_COLUMNS = 'room_id, client_id, role, joined_at';
 const MEDIA_ASSET_COLUMNS = 'id, room_id, message_id, object_key, kind, mime_type, byte_size, filename, width, height, duration_ms, uploaded_by_client_id, created_at';
 const PENDING_MEDIA_UPLOAD_COLUMNS = 'id, room_id, object_key, kind, mime_type, byte_size, filename, uploaded_by_client_id, expires_at, created_at';
 const AUDIO_TRANSCRIPTION_COLUMNS = 'asset_id, room_id, message_id, requested_by_client_id, status, transcript, language_code, provider, provider_transcript_id, error, created_at, updated_at, completed_at';
+const ASSISTANT_RUN_COLUMNS = 'id, room_id, requested_by_client_id, user_message_id, ai_message_id, status, model_id, api_model, provider, role_name, system_prompt, max_context_messages, retry_for_message_id, edited_message_id, error, metadata, created_at, queued_at, started_at, completed_at, updated_at';
+const OUTBOX_EVENT_COLUMNS = 'id, event_type, aggregate_type, aggregate_id, room_id, payload, status, attempts, available_at, locked_at, locked_by, processed_at, last_error, created_at, updated_at';
+const CLAIMED_OUTBOX_EVENT_COLUMNS = 'e.id, e.event_type, e.aggregate_type, e.aggregate_id, e.room_id, e.payload, e.status, e.attempts, e.available_at, e.locked_at, e.locked_by, e.processed_at, e.last_error, e.created_at, e.updated_at';
 const PUSH_SUBSCRIPTION_COLUMNS = 'endpoint, client_id, browser_instance_id, p256dh, auth, user_agent, created_at, updated_at';
 const ACCOUNT_SELECT_COLUMNS = `
   a.id AS account_id,
@@ -228,6 +286,12 @@ const mapRoom = (row: RoomRow): Room => {
   if (row.password_hash) room.hasPassword = true;
   const postingSchedule = parseJsonValue<RoomPostingSchedule>(row.posting_schedule);
   if (postingSchedule) room.postingSchedule = postingSchedule;
+  if (row.type && row.type !== 'chat') room.type = row.type;
+  if (row.sandbox_id) room.sandboxId = row.sandbox_id;
+  if (row.sandbox_status) room.sandboxStatus = row.sandbox_status;
+  if (row.sandbox_updated_at) room.sandboxUpdatedAt = toIsoString(row.sandbox_updated_at);
+  if (row.coco_session_id) room.cocoSessionId = row.coco_session_id;
+  if (row.coco_status) room.cocoStatus = row.coco_status;
   const roomVersion = Number(row.room_version || 0);
   if (roomVersion > 0) room.roomVersion = roomVersion;
   if (row.updated_at) room.updatedAt = toIsoString(row.updated_at);
@@ -308,6 +372,58 @@ const mapAudioTranscription = (row: AudioTranscriptionRow): AudioTranscriptionRe
   return record;
 };
 
+const mapAssistantRun = (row: AssistantRunRow): AssistantRunRecord => {
+  const run: AssistantRunRecord = {
+    id: row.id,
+    roomId: row.room_id,
+    requestedByClientId: row.requested_by_client_id,
+    aiMessageId: row.ai_message_id,
+    status: row.status,
+    modelId: row.model_id,
+    apiModel: row.api_model,
+    provider: row.provider,
+    createdAt: toIsoString(row.created_at),
+    queuedAt: toIsoString(row.queued_at),
+    updatedAt: toIsoString(row.updated_at),
+  };
+
+  if (row.user_message_id) run.userMessageId = row.user_message_id;
+  if (row.role_name) run.roleName = row.role_name;
+  if (row.system_prompt) run.systemPrompt = row.system_prompt;
+  const maxContextMessages = toOptionalNumber(row.max_context_messages);
+  if (maxContextMessages !== undefined) run.maxContextMessages = maxContextMessages;
+  if (row.retry_for_message_id) run.retryForMessageId = row.retry_for_message_id;
+  if (row.edited_message_id) run.editedMessageId = row.edited_message_id;
+  if (row.error) run.error = row.error;
+  if (row.started_at) run.startedAt = toIsoString(row.started_at);
+  if (row.completed_at) run.completedAt = toIsoString(row.completed_at);
+  const metadata = parseJsonValue<Record<string, unknown>>(row.metadata);
+  if (metadata) run.metadata = metadata;
+  return run;
+};
+
+const mapOutboxEvent = (row: OutboxEventRow): OutboxEventRecord => {
+  const event: OutboxEventRecord = {
+    id: row.id,
+    eventType: row.event_type,
+    aggregateType: row.aggregate_type,
+    aggregateId: row.aggregate_id,
+    payload: parseJsonValue<Record<string, unknown>>(row.payload) || {},
+    status: row.status,
+    attempts: Number(row.attempts) || 0,
+    availableAt: toIsoString(row.available_at),
+    createdAt: toIsoString(row.created_at),
+    updatedAt: toIsoString(row.updated_at),
+  };
+
+  if (row.room_id) event.roomId = row.room_id;
+  if (row.locked_at) event.lockedAt = toIsoString(row.locked_at);
+  if (row.locked_by) event.lockedBy = row.locked_by;
+  if (row.processed_at) event.processedAt = toIsoString(row.processed_at);
+  if (row.last_error) event.lastError = row.last_error;
+  return event;
+};
+
 const mapPushSubscription = (row: PushSubscriptionRow): PushSubscriptionRecord => ({
   clientId: row.client_id,
   browserInstanceId: row.browser_instance_id || undefined,
@@ -372,6 +488,15 @@ const mapMessage = (row: MessageRow): Message => {
   if (avatar) message.avatar = avatar;
   if (row.mime_type) message.mimeType = row.mime_type;
   if (row.status) message.status = row.status;
+  if (row.turn_id) message.turnId = row.turn_id;
+  if (row.tool_call_id) message.toolCallId = row.tool_call_id;
+  if (row.tool_name) message.toolName = row.tool_name;
+  const toolArgs = parseJsonValue<Record<string, unknown>>(row.tool_args);
+  if (toolArgs) message.toolArgs = toolArgs;
+  if (row.tool_output_preview) message.toolOutputPreview = row.tool_output_preview;
+  const exitCode = toOptionalNumber(row.exit_code ?? null);
+  if (exitCode !== undefined) message.exitCode = exitCode;
+  if (typeof row.is_error === 'boolean') message.isError = row.is_error;
   if (aiModel) message.aiModel = aiModel;
   if (usage) message.usage = usage;
   if (cost) message.cost = cost;
@@ -393,6 +518,13 @@ const messageParams = (message: Message, position: number): unknown[] => [
   toJsonb(message.avatar),
   message.mimeType || null,
   message.status || null,
+  message.turnId || null,
+  message.toolCallId || null,
+  message.toolName || null,
+  toJsonb(message.toolArgs),
+  message.toolOutputPreview || null,
+  message.exitCode ?? null,
+  message.isError ?? null,
   toJsonb(message.aiModel),
   toJsonb(message.usage),
   toJsonb(message.cost),
@@ -400,6 +532,48 @@ const messageParams = (message: Message, position: number): unknown[] => [
   toJsonb(message.uiPayload),
   getAIStreamOwnerId(message) || null,
   position,
+];
+
+const assistantRunParams = (run: AssistantRunRecord): unknown[] => [
+  run.id,
+  run.roomId,
+  run.requestedByClientId,
+  run.userMessageId || null,
+  run.aiMessageId,
+  run.status,
+  run.modelId,
+  run.apiModel,
+  run.provider,
+  run.roleName || null,
+  run.systemPrompt || null,
+  run.maxContextMessages ?? null,
+  run.retryForMessageId || null,
+  run.editedMessageId || null,
+  run.error || null,
+  toJsonb(run.metadata),
+  run.createdAt,
+  run.queuedAt,
+  run.startedAt || null,
+  run.completedAt || null,
+  run.updatedAt,
+];
+
+const outboxEventParams = (event: OutboxEventRecord): unknown[] => [
+  event.id,
+  event.eventType,
+  event.aggregateType,
+  event.aggregateId,
+  event.roomId || null,
+  toJsonb(event.payload),
+  event.status,
+  event.attempts,
+  event.availableAt,
+  event.lockedAt || null,
+  event.lockedBy || null,
+  event.processedAt || null,
+  event.lastError || null,
+  event.createdAt,
+  event.updatedAt,
 ];
 
 const INSERT_MESSAGE_SQL = `INSERT INTO room_messages (
@@ -414,6 +588,13 @@ const INSERT_MESSAGE_SQL = `INSERT INTO room_messages (
   avatar,
   mime_type,
   status,
+  turn_id,
+  tool_call_id,
+  tool_name,
+  tool_args,
+  tool_output_preview,
+  exit_code,
+  is_error,
   ai_model,
   usage,
   cost,
@@ -422,7 +603,7 @@ const INSERT_MESSAGE_SQL = `INSERT INTO room_messages (
   ai_stream_owner_id,
   position
 ) VALUES (
-  $1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12::jsonb, $13::jsonb, $14::jsonb, $15::jsonb, $16::jsonb, $17, $18
+  $1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, $15::jsonb, $16, $17, $18, $19::jsonb, $20::jsonb, $21::jsonb, $22::jsonb, $23::jsonb, $24, $25
 ) ON CONFLICT (id) DO UPDATE SET
   room_id = EXCLUDED.room_id,
   client_id = EXCLUDED.client_id,
@@ -434,6 +615,13 @@ const INSERT_MESSAGE_SQL = `INSERT INTO room_messages (
   avatar = EXCLUDED.avatar,
   mime_type = EXCLUDED.mime_type,
   status = EXCLUDED.status,
+  turn_id = EXCLUDED.turn_id,
+  tool_call_id = EXCLUDED.tool_call_id,
+  tool_name = EXCLUDED.tool_name,
+  tool_args = EXCLUDED.tool_args,
+  tool_output_preview = EXCLUDED.tool_output_preview,
+  exit_code = EXCLUDED.exit_code,
+  is_error = EXCLUDED.is_error,
   ai_model = EXCLUDED.ai_model,
   usage = EXCLUDED.usage,
   cost = EXCLUDED.cost,
@@ -441,6 +629,69 @@ const INSERT_MESSAGE_SQL = `INSERT INTO room_messages (
   ui_payload = EXCLUDED.ui_payload,
   ai_stream_owner_id = EXCLUDED.ai_stream_owner_id,
   position = room_messages.position`;
+
+const INSERT_ASSISTANT_RUN_SQL = `INSERT INTO assistant_runs (
+  id,
+  room_id,
+  requested_by_client_id,
+  user_message_id,
+  ai_message_id,
+  status,
+  model_id,
+  api_model,
+  provider,
+  role_name,
+  system_prompt,
+  max_context_messages,
+  retry_for_message_id,
+  edited_message_id,
+  error,
+  metadata,
+  created_at,
+  queued_at,
+  started_at,
+  completed_at,
+  updated_at
+) VALUES (
+  $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16::jsonb, $17, $18, $19, $20, $21
+) ON CONFLICT (id) DO UPDATE SET
+  status = EXCLUDED.status,
+  error = EXCLUDED.error,
+  metadata = EXCLUDED.metadata,
+  started_at = EXCLUDED.started_at,
+  completed_at = EXCLUDED.completed_at,
+  updated_at = EXCLUDED.updated_at
+RETURNING ${ASSISTANT_RUN_COLUMNS}`;
+
+const INSERT_OUTBOX_EVENT_SQL = `INSERT INTO outbox_events (
+  id,
+  event_type,
+  aggregate_type,
+  aggregate_id,
+  room_id,
+  payload,
+  status,
+  attempts,
+  available_at,
+  locked_at,
+  locked_by,
+  processed_at,
+  last_error,
+  created_at,
+  updated_at
+) VALUES (
+  $1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11, $12, $13, $14, $15
+) ON CONFLICT (id) DO UPDATE SET
+  payload = EXCLUDED.payload,
+  status = EXCLUDED.status,
+  attempts = EXCLUDED.attempts,
+  available_at = EXCLUDED.available_at,
+  locked_at = EXCLUDED.locked_at,
+  locked_by = EXCLUDED.locked_by,
+  processed_at = EXCLUDED.processed_at,
+  last_error = EXCLUDED.last_error,
+  updated_at = EXCLUDED.updated_at
+RETURNING ${OUTBOX_EVENT_COLUMNS}`;
 
 export class PostgresStore implements DurableRoomStore {
   constructor(
@@ -567,6 +818,10 @@ export class PostgresStore implements DurableRoomStore {
       this.logger.error('Error appending message to PostgreSQL', { error, roomId: message.roomId, messageId: message.id });
       return null;
     }
+  }
+
+  async appendMessageWithAtomicPosition(message: Message): Promise<Room | null> {
+    return this.appendMessage(message);
   }
 
   async appendMediaMessageWithAsset(message: Message, asset: MediaAsset): Promise<MediaMessageAppendResult | null> {
@@ -1449,16 +1704,221 @@ export class PostgresStore implements DurableRoomStore {
     }
   }
 
+  async createAssistantRun(run: AssistantRunRecord): Promise<AssistantRunRecord | null> {
+    try {
+      const result = await this.pool.query<AssistantRunRow>(INSERT_ASSISTANT_RUN_SQL, assistantRunParams(run));
+      return result.rows[0] ? mapAssistantRun(result.rows[0]) : null;
+    } catch (error) {
+      this.logger.error('Error creating PostgreSQL assistant run', { error, runId: run.id, roomId: run.roomId });
+      return null;
+    }
+  }
+
+  async getAssistantRun(runId: string): Promise<AssistantRunRecord | null> {
+    try {
+      const result = await this.pool.query<AssistantRunRow>(
+        `SELECT ${ASSISTANT_RUN_COLUMNS} FROM assistant_runs WHERE id = $1`,
+        [runId]
+      );
+      return result.rows[0] ? mapAssistantRun(result.rows[0]) : null;
+    } catch (error) {
+      this.logger.error('Error reading PostgreSQL assistant run', { error, runId });
+      return null;
+    }
+  }
+
+  async updateAssistantRun(runId: string, updates: AssistantRunUpdate): Promise<AssistantRunRecord | null> {
+    const now = updates.updatedAt || new Date().toISOString();
+    try {
+      const result = await this.pool.query<AssistantRunRow>(
+        `UPDATE assistant_runs
+        SET status = COALESCE($2, status),
+          error = CASE WHEN $3::boolean THEN $4 ELSE error END,
+          started_at = CASE WHEN $5::boolean THEN $6::timestamptz ELSE started_at END,
+          completed_at = CASE WHEN $7::boolean THEN $8::timestamptz ELSE completed_at END,
+          metadata = CASE WHEN $9::boolean THEN $10::jsonb ELSE metadata END,
+          updated_at = $11::timestamptz
+        WHERE id = $1
+        RETURNING ${ASSISTANT_RUN_COLUMNS}`,
+        [
+          runId,
+          updates.status || null,
+          Object.prototype.hasOwnProperty.call(updates, 'error'),
+          updates.error ?? null,
+          Object.prototype.hasOwnProperty.call(updates, 'startedAt'),
+          updates.startedAt ?? null,
+          Object.prototype.hasOwnProperty.call(updates, 'completedAt'),
+          updates.completedAt ?? null,
+          Object.prototype.hasOwnProperty.call(updates, 'metadata'),
+          toJsonb(updates.metadata ?? null),
+          now,
+        ]
+      );
+      return result.rows[0] ? mapAssistantRun(result.rows[0]) : null;
+    } catch (error) {
+      this.logger.error('Error updating PostgreSQL assistant run', { error, runId, updates });
+      return null;
+    }
+  }
+
+  async createOutboxEvent(event: OutboxEventRecord): Promise<OutboxEventRecord | null> {
+    try {
+      const result = await this.pool.query<OutboxEventRow>(INSERT_OUTBOX_EVENT_SQL, outboxEventParams(event));
+      return result.rows[0] ? mapOutboxEvent(result.rows[0]) : null;
+    } catch (error) {
+      this.logger.error('Error creating PostgreSQL outbox event', { error, eventId: event.id, eventType: event.eventType });
+      return null;
+    }
+  }
+
+  async createAssistantRunWithOutbox(run: AssistantRunRecord, event: OutboxEventRecord): Promise<{ run: AssistantRunRecord; event: OutboxEventRecord } | null> {
+    try {
+      return await this.transaction(async client => {
+        const runResult = await client.query<AssistantRunRow>(INSERT_ASSISTANT_RUN_SQL, assistantRunParams(run));
+        const eventResult = await client.query<OutboxEventRow>(INSERT_OUTBOX_EVENT_SQL, outboxEventParams(event));
+        if (!runResult.rows[0] || !eventResult.rows[0]) {
+          return null;
+        }
+        return {
+          run: mapAssistantRun(runResult.rows[0]),
+          event: mapOutboxEvent(eventResult.rows[0]),
+        };
+      });
+    } catch (error) {
+      this.logger.error('Error creating PostgreSQL assistant run with outbox event', { error, runId: run.id, eventId: event.id });
+      return null;
+    }
+  }
+
+  async claimOutboxEvents(options: OutboxClaimOptions): Promise<OutboxEventRecord[]> {
+    const now = options.now || new Date().toISOString();
+    const lockMs = Math.max(1000, options.lockMs || 60_000);
+    const limit = Math.min(100, Math.max(1, Math.floor(options.limit || 10)));
+    const eventTypes = options.eventTypes?.filter(Boolean);
+
+    try {
+      const result = await this.transaction(async client => {
+        const params: unknown[] = [now, options.workerId, limit, lockMs];
+        const eventTypeClause = eventTypes && eventTypes.length > 0
+          ? `AND event_type = ANY($5::text[])`
+          : '';
+        if (eventTypes && eventTypes.length > 0) {
+          params.push(eventTypes);
+        }
+
+        return client.query<OutboxEventRow>(
+          `WITH candidates AS (
+            SELECT id
+            FROM outbox_events
+            WHERE (
+              status = 'pending'
+              OR (
+                status = 'processing'
+                AND locked_at < ($1::timestamptz - (($4::int || ' milliseconds')::interval))
+              )
+            )
+            AND available_at <= $1::timestamptz
+            ${eventTypeClause}
+            ORDER BY created_at ASC
+            LIMIT $3
+            FOR UPDATE SKIP LOCKED
+          )
+          UPDATE outbox_events e
+          SET status = 'processing',
+            attempts = e.attempts + 1,
+            locked_at = $1::timestamptz,
+            locked_by = $2,
+            updated_at = $1::timestamptz
+          FROM candidates
+          WHERE e.id = candidates.id
+          RETURNING ${CLAIMED_OUTBOX_EVENT_COLUMNS}`,
+          params
+        );
+      });
+      return result.rows.map(mapOutboxEvent);
+    } catch (error) {
+      this.logger.error('Error claiming PostgreSQL outbox events', { error, options });
+      return [];
+    }
+  }
+
+  async markOutboxEventProcessed(eventId: string, processedAt = new Date().toISOString()): Promise<OutboxEventRecord | null> {
+    try {
+      const result = await this.pool.query<OutboxEventRow>(
+        `UPDATE outbox_events
+        SET status = 'processed',
+          processed_at = $2::timestamptz,
+          locked_at = NULL,
+          locked_by = NULL,
+          last_error = NULL,
+          updated_at = $2::timestamptz
+        WHERE id = $1
+        RETURNING ${OUTBOX_EVENT_COLUMNS}`,
+        [eventId, processedAt]
+      );
+      return result.rows[0] ? mapOutboxEvent(result.rows[0]) : null;
+    } catch (error) {
+      this.logger.error('Error marking PostgreSQL outbox event processed', { error, eventId });
+      return null;
+    }
+  }
+
+  async markOutboxEventFailed(eventId: string, errorMessage: string, options: OutboxFailOptions = {}): Promise<OutboxEventRecord | null> {
+    const now = options.now || new Date().toISOString();
+    const retryDelayMs = Math.max(0, options.retryDelayMs || 30_000);
+    const maxAttempts = Math.max(1, options.maxAttempts || 10);
+
+    try {
+      const result = await this.pool.query<OutboxEventRow>(
+        `UPDATE outbox_events
+        SET status = CASE WHEN attempts >= $5 THEN 'failed' ELSE 'pending' END,
+          available_at = CASE WHEN attempts >= $5 THEN available_at ELSE ($2::timestamptz + (($4::int || ' milliseconds')::interval)) END,
+          locked_at = NULL,
+          locked_by = NULL,
+          last_error = $3,
+          updated_at = $2::timestamptz
+        WHERE id = $1
+        RETURNING ${OUTBOX_EVENT_COLUMNS}`,
+        [eventId, now, errorMessage, retryDelayMs, maxAttempts]
+      );
+      return result.rows[0] ? mapOutboxEvent(result.rows[0]) : null;
+    } catch (error) {
+      this.logger.error('Error marking PostgreSQL outbox event failed', { error, eventId, errorMessage });
+      return null;
+    }
+  }
+
   async saveRoom(room: Room): Promise<Room | null> {
     try {
       return await this.transaction(async client => {
         const result = await client.query<RoomRow>(
-          `INSERT INTO rooms (id, name, description, created_at, last_activity_at, creator_id, room_version, updated_at)
-          VALUES ($1, $2, $3, $4, $5, $6, 1, NOW())
+          `INSERT INTO rooms (
+            id,
+            name,
+            description,
+            created_at,
+            last_activity_at,
+            creator_id,
+            type,
+            sandbox_id,
+            sandbox_status,
+            sandbox_updated_at,
+            coco_session_id,
+            coco_status,
+            room_version,
+            updated_at
+          )
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 1, NOW())
           ON CONFLICT (id) DO UPDATE SET
             name = EXCLUDED.name,
             description = EXCLUDED.description,
             last_activity_at = GREATEST(rooms.last_activity_at, EXCLUDED.last_activity_at),
+            type = CASE WHEN $13::boolean THEN EXCLUDED.type ELSE rooms.type END,
+            sandbox_id = COALESCE(EXCLUDED.sandbox_id, rooms.sandbox_id),
+            sandbox_status = COALESCE(EXCLUDED.sandbox_status, rooms.sandbox_status),
+            sandbox_updated_at = COALESCE(EXCLUDED.sandbox_updated_at, rooms.sandbox_updated_at),
+            coco_session_id = COALESCE(EXCLUDED.coco_session_id, rooms.coco_session_id),
+            coco_status = COALESCE(EXCLUDED.coco_status, rooms.coco_status),
             room_version = rooms.room_version + 1, updated_at = NOW()
           RETURNING ${ROOM_COLUMNS}`,
           [
@@ -1468,6 +1928,13 @@ export class PostgresStore implements DurableRoomStore {
             room.createdAt,
             room.lastActivityAt || room.createdAt,
             room.creatorId,
+            room.type || 'chat',
+            room.sandboxId || null,
+            room.sandboxStatus || null,
+            room.sandboxUpdatedAt || null,
+            room.cocoSessionId || null,
+            room.cocoStatus || null,
+            room.type !== undefined,
           ]
         );
 
@@ -2122,8 +2589,75 @@ export class PostgresStore implements DurableRoomStore {
     }
   }
 
+  async compareAndSetRoomSandboxStatus(
+    roomId: string,
+    expectedStatuses: RoomSandboxStatus[],
+    nextStatus: RoomSandboxStatus,
+    updatedAt = new Date().toISOString()
+  ): Promise<Room | null> {
+    if (expectedStatuses.length === 0) {
+      return null;
+    }
+
+    try {
+      const result = await this.pool.query<RoomRow>(
+        `UPDATE rooms
+        SET sandbox_status = $3,
+          sandbox_updated_at = $4::timestamptz,
+          room_version = room_version + 1,
+          updated_at = NOW()
+        WHERE id = $1
+          AND COALESCE(sandbox_status, 'none') = ANY($2::text[])
+        RETURNING ${ROOM_COLUMNS}`,
+        [roomId, expectedStatuses, nextStatus, updatedAt]
+      );
+      return result.rows[0] ? mapRoom(result.rows[0]) : null;
+    } catch (error) {
+      this.logger.error('Error comparing and setting PostgreSQL room sandbox status', { error, roomId, expectedStatuses, nextStatus });
+      return null;
+    }
+  }
+
+  async findInterruptedCocoRooms(): Promise<Room[]> {
+    try {
+      const result = await this.pool.query<RoomRow>(
+        `SELECT ${ROOM_COLUMNS}
+        FROM rooms
+        WHERE type = 'coco'
+          AND (sandbox_status = 'creating' OR coco_status = 'running')`
+      );
+      return result.rows.map(mapRoom);
+    } catch (error) {
+      this.logger.error('Error finding interrupted PostgreSQL Coco rooms', { error });
+      return [];
+    }
+  }
+
+  async findDanglingToolCalls(): Promise<Message[]> {
+    try {
+      const result = await this.pool.query<MessageRow>(
+        `SELECT ${MESSAGE_COLUMNS}
+        FROM room_messages call
+        WHERE call.message_type = 'tool_call'
+          AND call.tool_call_id IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1
+            FROM room_messages result
+            WHERE result.room_id = call.room_id
+              AND result.message_type = 'tool_result'
+              AND result.tool_call_id = call.tool_call_id
+          )
+        ORDER BY call.timestamp ASC`
+      );
+      return result.rows.map(mapMessage);
+    } catch (error) {
+      this.logger.error('Error finding dangling PostgreSQL tool calls', { error });
+      return [];
+    }
+  }
+
   async resetAllDataForTests(): Promise<void> {
-    await this.pool.query('TRUNCATE room_ai_cost_totals, audio_transcriptions, pending_media_uploads, media_assets, room_messages, room_saves, room_members, rooms, client_auth_tokens, client_passwords, client_account_links, account_identities, accounts, client_profiles RESTART IDENTITY CASCADE');
+    await this.pool.query('TRUNCATE outbox_events, assistant_runs, room_ai_cost_totals, audio_transcriptions, pending_media_uploads, media_assets, room_messages, room_saves, room_members, rooms, client_auth_tokens, client_passwords, client_account_links, account_identities, accounts, client_profiles RESTART IDENTITY CASCADE');
   }
 
   async failInterruptedStreamingMessages(content: string, options: InterruptedStreamingMessageRecoveryOptions = {}): Promise<number> {

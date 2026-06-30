@@ -6,6 +6,7 @@ import {
   editMessage,
   expectChatRoom,
   expectMessage,
+  fakeAIResponseText,
   getClientRoomsViaApi,
   joinRoomById,
   openRoomFromCard,
@@ -57,7 +58,7 @@ async function askAI(page: Parameters<typeof openRoomsPage>[0], prompt: string) 
   await page.keyboard.insertText(prompt);
   await page.getByRole('button', { name: 'Ask AI' }).click();
   await expectMessage(page, prompt).toBeVisible();
-  await expectMessage(page, `E2E AI response to: ${prompt}`).toBeVisible();
+  await expectMessage(page, fakeAIResponseText(prompt)).toBeVisible();
 }
 
 test('persists room and message operations across reloads and fresh contexts', async ({ page, context, request, browser }) => {
@@ -109,7 +110,7 @@ test('persists fake AI, image messages, and shared room joins in PostgreSQL mode
   await openRoomFromCard(page, room);
 
   const prompt = uniqueName('pg-ai-prompt');
-  const responseText = `E2E AI response to: ${prompt}`;
+  const responseText = fakeAIResponseText(prompt);
   await askAI(page, prompt);
   await page.reload();
   await expectChatRoom(page, room.name);
@@ -118,7 +119,11 @@ test('persists fake AI, image messages, and shared room joins in PostgreSQL mode
   await page.getByTestId('message-editor').click();
   await page.getByTestId('image-upload-input').setInputFiles(tinyPng);
   await expect(page.getByTestId('message-editor').locator('img')).toHaveCount(1);
-  await page.getByRole('button', { name: 'Send' }).click();
+  const sendButton = page.getByTestId('message-input-panel').getByRole('button', { name: 'Send' });
+  await expect(sendButton).toBeEnabled();
+  await sendButton.click();
+  await expect(sendButton).not.toHaveAttribute('data-loading', 'true', { timeout: 20000 });
+  await expect(page.getByTestId('message-editor').locator('img')).toHaveCount(0, { timeout: 20000 });
   await expect(page.getByRole('img', { name: 'Shared image' }).first()).toBeVisible();
   await page.reload();
   await expectChatRoom(page, room.name);

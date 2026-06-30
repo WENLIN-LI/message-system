@@ -12,6 +12,7 @@ import { LocalMediaObjectStorage } from '../services/mediaObjectStorage';
 import { Logger } from '../logger';
 import { AudioTranscriptionRecord, AudioTranscriptionUpdate, ClientAccount, ClientAuthTokenRecord, CreateGoogleAccountInput, GoogleAccountProfile, PendingMediaUpload } from '../repositories/store';
 import { AudioTranscriptionJob } from '../services/audioTranscription';
+import { createCocoAccessControl } from '../services/cocoAccessControl';
 
 type EmittedEvent = {
   target: string;
@@ -190,6 +191,7 @@ async function createTestServer(overrides: {
   audioTranscriptionRunner?: Parameters<typeof registerApiRoutes>[1]['audioTranscriptionRunner'];
   googleClientIds?: Parameters<typeof registerApiRoutes>[1]['googleClientIds'];
   verifyGoogleCredential?: Parameters<typeof registerApiRoutes>[1]['verifyGoogleCredential'];
+  cocoAccess?: Parameters<typeof registerApiRoutes>[1]['cocoAccess'];
 } = {}): Promise<TestServer> {
   const app = express();
   app.use(express.json({ limit: '1mb' }));
@@ -570,6 +572,10 @@ async function createTestServer(overrides: {
     audioTranscriptionRunner,
     googleClientIds: overrides.googleClientIds,
     verifyGoogleCredential: overrides.verifyGoogleCredential,
+    cocoAccess: overrides.cocoAccess ?? createCocoAccessControl({ enabled: true }),
+    cocoMode: 'acceptEdits',
+    cocoAvailableModes: ['plan', 'acceptEdits'],
+    cocoDefaultMode: 'plan',
     mediaUploadCleanup: overrides.mediaUploadCleanup,
   });
 
@@ -621,11 +627,24 @@ describe('API routes', () => {
 
     const statusResponse = await fetch(`${server.baseUrl}/api/status`);
     assert.equal(statusResponse.status, 200);
-    const status = await statusResponse.json() as { status: string; persistenceStore: string; redis: string; rooms: number };
+    const status = await statusResponse.json() as { status: string; persistenceStore: string; redis: string; rooms: number; features: { coco: { enabled: boolean; rollout: string; mode: string; availableModes: string[]; defaultMode: string } } };
     assert.equal(status.status, 'online');
     assert.equal(status.persistenceStore, 'redis');
     assert.equal(status.redis, 'connected');
     assert.equal(status.rooms, 1);
+    assert.deepEqual(status.features.coco, { enabled: true, rollout: 'all', mode: 'acceptEdits', availableModes: ['plan', 'acceptEdits'], defaultMode: 'plan' });
+
+    const featuresResponse = await fetch(`${server.baseUrl}/api/features?clientId=client-1`);
+    assert.equal(featuresResponse.status, 200);
+    assert.deepEqual(await featuresResponse.json(), {
+      coco: {
+        enabled: true,
+        rollout: 'all',
+        mode: 'acceptEdits',
+        availableModes: ['plan', 'acceptEdits'],
+        defaultMode: 'plan',
+      },
+    });
   });
 
   it('redirects sticker asset requests to object storage signed URLs', async () => {
@@ -1157,6 +1176,43 @@ describe('API routes', () => {
     assert.deepEqual(server.emitted, [{ target: 'client-2', event: 'new_room', payload: room }]);
   });
 
+  it('creates Coco rooms through the API only when rollout controls allow it', async () => {
+    const response = await fetch(`${server.baseUrl}/api/clients/client-2/rooms`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'API Coco', description: 'Code work', type: 'coco' }),
+    });
+
+    assert.equal(response.status, 201);
+    const room = await response.json() as Room;
+    assert.equal(room.id, 'generated-room');
+    assert.equal(room.name, 'API Coco');
+    assert.equal(room.description, 'Code work');
+    assert.equal(room.type, 'coco');
+    assert.equal(room.sandboxStatus, 'none');
+    assert.equal(room.cocoStatus, 'idle');
+    assert.ok(room.sandboxUpdatedAt);
+    assert.deepEqual(server.emitted, [{ target: 'client-2', event: 'new_room', payload: room }]);
+
+    const deniedServer = await createTestServer({
+      cocoAccess: createCocoAccessControl({ enabled: false }),
+    });
+    try {
+      const deniedResponse = await fetch(`${deniedServer.baseUrl}/api/clients/client-2/rooms`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ name: 'API Coco', type: 'coco' }),
+      });
+
+      assert.equal(deniedResponse.status, 403);
+      assert.deepEqual(await deniedResponse.json(), { error: 'Coco is disabled' });
+      assert.equal(deniedServer.store.savedRooms.length, 0);
+      assert.deepEqual(deniedServer.emitted, []);
+    } finally {
+      await deniedServer.close();
+    }
+  });
+
   it('does not emit API rooms when room persistence fails', async () => {
     server.store.saveRoom = async (room: Room) => {
       server.store.savedRooms.push(room);
@@ -1655,7 +1711,7 @@ describe('API routes', () => {
 
   it('passes attachment content disposition when creating file download URLs', async () => {
     await server.close();
-    const readInputs: Array<{ objectKey: string; expiresInSeconds?: number; responseContentDisposition?: string }> = [];
+    const readInputs: Array<{ objectKey: string; expiresInSeconds?: number; responseContentDisposition?: string; responseCacheControl?: string }> = [];
     server = await createTestServer({
       mediaObjectStorage: {
         isConfigured: () => true,
@@ -1663,7 +1719,7 @@ describe('API routes', () => {
         async createWriteUrl({ objectKey }: { objectKey: string }) {
           return { url: `https://upload.example/${encodeURIComponent(objectKey)}`, expiresAt: '2026-05-03T00:15:00.000Z' };
         },
-        async createReadUrl(input: { objectKey: string; expiresInSeconds?: number; responseContentDisposition?: string }) {
+        async createReadUrl(input: { objectKey: string; expiresInSeconds?: number; responseContentDisposition?: string; responseCacheControl?: string }) {
           readInputs.push(input);
           return { url: `https://download.example/${encodeURIComponent(input.objectKey)}`, expiresAt: '2026-05-03T00:15:00.000Z' };
         },
@@ -1689,7 +1745,10 @@ describe('API routes', () => {
     const response = await fetch(`${server.baseUrl}/api/media/file-asset-1/download-url?roomId=room-1&clientId=client-2`);
 
     assert.equal(response.status, 200);
+    const payload = await response.json() as { url: string };
+    assert.equal(payload.url, 'https://download.example/rooms%2Froom-1%2Fmedia%2Ffile%2Ffile-asset-1');
     assert.equal(readInputs[0]?.responseContentDisposition, "attachment; filename*=UTF-8''report%20final.html");
+    assert.equal(readInputs[0]?.responseCacheControl, 'private, max-age=900');
   });
 
   it('forces attachment disposition for local file object downloads', async () => {
@@ -1770,9 +1829,6 @@ describe('API routes', () => {
         },
         async headObject() {
           return { exists: true };
-        },
-        async getMediaObject() {
-          return { body: Buffer.from('stored'), mimeType: 'text/html', byteSize: 6 };
         },
       },
     });

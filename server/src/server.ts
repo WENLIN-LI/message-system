@@ -18,11 +18,36 @@ import { AI_ROLE_GENERATOR_MODEL_ID, createAIModelRegistry, DEFAULT_AI_MODEL_ID 
 import { registerApiRoutes } from './routes/apiRoutes';
 import { loadStickerCatalog } from './stickers/catalog';
 import { registerSocketHandlers } from './socket/registerSocketHandlers';
+import { executeQueuedAssistantRun } from './socket/aiHandlers';
 import { createAIClients } from './services/aiClients';
 import { createAIRoleDraftGenerator } from './services/aiRoleGenerator';
 import { resolveAIStreamOwnerId } from './services/aiStreamRecovery';
 import { createMediaObjectStorageFromEnv } from './services/mediaObjectStorage';
 import { createAssemblyAIAudioTranscriptionRunner } from './services/audioTranscription';
+import { resolveCorsOrigin } from './services/corsConfig';
+import { createOutboxWorkerFromEnv, OutboxWorker } from './services/outboxWorker';
+import { createCocoAccessControl } from './services/cocoAccessControl';
+import { createCodeAgentRunner } from './services/codeAgentRunner';
+import { CocoSandboxLifecycleService } from './services/cocoSandboxLifecycle';
+import { CocoSessionService } from './services/cocoSessionService';
+import { E2BCocoSandboxService, E2BSandboxDriver } from './services/e2bCocoSandboxService';
+import { createE2BSdkDriver } from './services/e2bSdkDriver';
+import { COCO_RUNNER_SCHEMA_VERSION } from './services/cocoRunnerProtocol';
+import {
+  DEFAULT_COCO_E2B_KILL_TIMEOUT_MS,
+  DEFAULT_COCO_E2B_PAUSE_TIMEOUT_MS,
+  resolveCocoRuntimeConfig,
+} from './services/cocoRuntimeConfig';
+import {
+  CocoModelGateway,
+  DEFAULT_COCO_MODEL_GATEWAY_BASE_PATH,
+  DEFAULT_COCO_MODEL_GATEWAY_BODY_LIMIT,
+  RedisCocoModelGatewayTokenStateStore,
+  registerCocoModelGatewayRoutes,
+} from './services/cocoModelGateway';
+import { FakeCocoRunnerClient } from './services/fakeCocoRunner';
+import { FakeCocoSandboxService } from './services/fakeCocoSandboxService';
+import { JsonlCocoRunnerClient } from './services/jsonlCocoRunner';
 
 dotenv.config();
 
@@ -33,6 +58,8 @@ const postgresLogger = new Logger('PostgreSQL');
 const socketLogger = new Logger('SocketIO');
 const routeLogger = new Logger('Routes');
 const openaiLogger = new Logger('OpenAI');
+const outboxLogger = new Logger('OutboxWorker');
+const cocoLogger = new Logger('Coco');
 const mediaStorageLogger = new Logger('MediaStorage');
 const mediaObjectStorage = createMediaObjectStorageFromEnv(mediaStorageLogger);
 const aiStreamOwnerId = resolveAIStreamOwnerId();
@@ -58,16 +85,24 @@ const resolveClientDistPath = () => {
   return candidates.find(candidate => fs.existsSync(candidate)) || candidates[0];
 };
 const clientDistPath = resolveClientDistPath();
+const corsOrigin = resolveCorsOrigin();
 
 // 初始化 Express 应用
 const app = express();
 app.use(cors({
-  origin: process.env.CLIENT_URL || '*',
+  origin: corsOrigin,
   methods: ['GET', 'POST', 'PUT'],
   credentials: true,
 }));
 console.log(`process.env.CLIENT_URL: ${process.env.CLIENT_URL}`);
-app.use(express.json());
+const defaultJsonParser = express.json();
+app.use((req: Request, res: Response, next: NextFunction) => {
+  if (req.path === DEFAULT_COCO_MODEL_GATEWAY_BASE_PATH || req.path.startsWith(`${DEFAULT_COCO_MODEL_GATEWAY_BASE_PATH}/`)) {
+    next();
+    return;
+  }
+  defaultJsonParser(req, res, next);
+});
 
 // 添加HTTP请求日志中间件
 app.use(httpLogger);
@@ -105,6 +140,40 @@ if (PERSISTENCE_STORE === 'postgres') {
   serverLogger.warn('Unknown PERSISTENCE_STORE value, falling back to Redis', { persistenceStore: PERSISTENCE_STORE });
 }
 
+const parsePositiveIntegerEnv = (name: string, fallback: number) => {
+  const value = Number.parseInt(process.env[name] || '', 10);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+};
+
+const cocoRuntimeConfig = resolveCocoRuntimeConfig(process.env);
+const cocoAccess = createCocoAccessControl({
+  enabled: cocoRuntimeConfig.enabled,
+  allowedClientIds: cocoRuntimeConfig.allowedClientIds,
+});
+const cocoModelGateway = cocoRuntimeConfig.modelGateway
+  ? new CocoModelGateway({
+    publicBaseUrl: cocoRuntimeConfig.modelGateway.publicBaseUrl,
+    tokenSecret: cocoRuntimeConfig.modelGateway.tokenSecret,
+    tokenTtlSeconds: cocoRuntimeConfig.modelGateway.tokenTtlSeconds,
+    maxRequestsPerTurn: cocoRuntimeConfig.modelGateway.maxRequestsPerTurn,
+    turnBudgetUsd: cocoRuntimeConfig.modelGateway.turnBudgetUsd,
+    providerApiKeys: {
+      anthropic: process.env.ANTHROPIC_API_KEY,
+      deepseek: process.env.DEEPSEEK_API_KEY,
+      openai: process.env.OPENAI_API_KEY,
+      openrouter: process.env.OPENROUTER_API_KEY,
+    },
+    providerBaseUrls: {
+      anthropic: process.env.ANTHROPIC_BASE_URL,
+      deepseek: process.env.DEEPSEEK_BASE_URL,
+      openai: process.env.OPENAI_BASE_URL,
+      openrouter: process.env.OPENROUTER_BASE_URL,
+    },
+    stateStore: new RedisCocoModelGatewayTokenStateStore(redisClient),
+    logger: cocoLogger,
+  })
+  : undefined;
+
 redisClient.on('error', (err: Error) => {
   redisLogger.error('Redis connection error', { error: err.message, stack: err.stack });
 });
@@ -125,13 +194,84 @@ subClient.on('error', (err: Error) => {
 // 初始化 Socket.IO 服务器（暂不设置适配器，等待 Redis 连接后再设置）
 const io = new Server(server, {
   cors: {
-    origin: '*',
-    methods: ['GET', 'POST']
+    origin: corsOrigin,
+    methods: ['GET', 'POST'],
+    credentials: true,
   },
   maxHttpBufferSize: 5 * 1024 * 1024, // 设置最大消息大小为 5MB
   pingTimeout: 60000, // 60秒超时
   pingInterval: 25000 // 25秒ping一次
 });
+
+const createE2BDriver = (): E2BSandboxDriver => createE2BSdkDriver({
+  apiKey: process.env.E2B_API_KEY,
+  accessToken: process.env.E2B_ACCESS_TOKEN,
+  domain: process.env.E2B_DOMAIN,
+  apiUrl: process.env.E2B_API_URL,
+  sandboxUrl: process.env.E2B_SANDBOX_URL,
+  requestTimeoutMs: parsePositiveIntegerEnv('E2B_REQUEST_TIMEOUT_MS', 60_000),
+});
+
+if (cocoRuntimeConfig.enabled && cocoRuntimeConfig.sandboxProvider === 'e2b') {
+  cocoLogger.info('E2B sandbox provider selected', { artifactMode: cocoRuntimeConfig.artifactMode });
+}
+
+const cocoSandboxService = cocoRuntimeConfig.enabled && cocoRuntimeConfig.sandboxProvider === 'e2b'
+  ? new E2BCocoSandboxService(createE2BDriver(), {
+    templateId: cocoRuntimeConfig.e2bTemplateId || '',
+    workspace: cocoRuntimeConfig.e2bWorkspace,
+    artifactVersion: cocoRuntimeConfig.artifactVersion,
+    cocoSourceRef: cocoRuntimeConfig.cocoSourceRef,
+    lifecycle: cocoRuntimeConfig.e2bLifecycle,
+    logger: cocoLogger,
+  })
+  : new FakeCocoSandboxService();
+const cocoTurnTimeoutMs = parsePositiveIntegerEnv('COCO_TURN_TIMEOUT_MS', 5 * 60 * 1000);
+const defaultCocoSandboxTtlMs = cocoRuntimeConfig.e2bLifecycle.onTimeout === 'pause'
+  ? DEFAULT_COCO_E2B_PAUSE_TIMEOUT_MS
+  : DEFAULT_COCO_E2B_KILL_TIMEOUT_MS;
+const cocoSandboxLifecycle = new CocoSandboxLifecycleService(store, cocoSandboxService, cocoLogger, {
+  sandboxTtlMs: parsePositiveIntegerEnv('COCO_SANDBOX_TTL_MS', defaultCocoSandboxTtlMs),
+  turnTimeoutMs: cocoTurnTimeoutMs,
+  creatingStaleMs: parsePositiveIntegerEnv('COCO_CREATING_STALE_MS', 2 * 60 * 1000),
+  maxActiveSandboxes: parsePositiveIntegerEnv('COCO_MAX_ACTIVE_SANDBOXES', Number.POSITIVE_INFINITY),
+  maxActiveSandboxesPerUser: parsePositiveIntegerEnv('COCO_MAX_ACTIVE_SANDBOXES_PER_USER', Number.POSITIVE_INFINITY),
+  reconnectTimedOutSandboxes: cocoRuntimeConfig.e2bLifecycle.onTimeout === 'pause',
+});
+const fakeCocoToolOutput = [
+  'stdout: hello from Coco fake runner',
+  'stderr: simulated warning for UI coverage',
+  'line '.repeat(260).trim(),
+].join('\n');
+const cocoRunnerClient = cocoRuntimeConfig.runnerClient === 'jsonl' ? new JsonlCocoRunnerClient() : new FakeCocoRunnerClient([
+  { schemaVersion: COCO_RUNNER_SCHEMA_VERSION, type: 'status', turnId: 'fake', status: 'starting', message: 'Coco fake runner starting' },
+  { schemaVersion: COCO_RUNNER_SCHEMA_VERSION, type: 'text_delta', messageId: 'fake-ai', delta: 'Coco fake runner received the task.' },
+  { schemaVersion: COCO_RUNNER_SCHEMA_VERSION, type: 'tool_call', id: 'fake-tool-1', name: 'Shell', args: { command: 'printf "hello from Coco fake runner\\n"' } },
+  { schemaVersion: COCO_RUNNER_SCHEMA_VERSION, type: 'tool_result', id: 'fake-tool-1', name: 'Shell', success: false, output: fakeCocoToolOutput, exitCode: 2, truncated: true },
+  { schemaVersion: COCO_RUNNER_SCHEMA_VERSION, type: 'final', messageId: 'fake-ai', answer: 'Coco fake runner received the task.', sessionId: 'fake-coco-session' },
+], { eventDelayMs: parsePositiveIntegerEnv('COCO_FAKE_RUNNER_EVENT_DELAY_MS', 0) });
+const codeAgentRunner = createCodeAgentRunner(cocoRuntimeConfig.backend, cocoRunnerClient);
+const cocoSessionService = new CocoSessionService(
+  store,
+  io,
+  cocoSandboxLifecycle,
+  cocoSandboxService,
+  codeAgentRunner,
+  cocoLogger,
+  {
+    enabled: cocoRuntimeConfig.enabled,
+    allowedClientIds: cocoRuntimeConfig.allowedClientIds,
+    mode: cocoRuntimeConfig.mode,
+    availableModes: cocoRuntimeConfig.availableModes,
+    defaultMode: cocoRuntimeConfig.defaultMode,
+    modelGateway: cocoModelGateway,
+    runnerCommand: cocoRuntimeConfig.runnerCommand,
+    turnTimeoutMs: cocoTurnTimeoutMs,
+    allowedPaths: cocoRuntimeConfig.allowedPaths,
+    runnerEnv: cocoRuntimeConfig.runnerEnv,
+    runnerProviderEnvByProvider: cocoRuntimeConfig.runnerProviderEnvByProvider,
+  }
+);
 
 // 初始化 Redis、PostgreSQL schema 和 Socket.IO 适配器
 const infrastructureReady = (async () => {
@@ -155,6 +295,7 @@ const infrastructureReady = (async () => {
     }
     await store.clearRealtimeRoomMembers?.();
     await store.failInterruptedStreamingMessages?.('Response interrupted.', { aiStreamOwnerId });
+    await cocoSandboxLifecycle.recoverInterruptedSandboxes();
     
     redisLogger.info('Connected to Redis and Socket.IO adapter initialized', { persistenceStore: activePersistenceStore });
   } catch (err) {
@@ -183,9 +324,52 @@ registerSocketHandlers({
   getAIClientForModel,
   aiStreamOwnerId,
   assemblyAIApiKey,
+  cocoSessionService,
+  cocoAccess,
+  cocoSandboxService,
 });
 
+let outboxWorker: OutboxWorker | null = null;
+if (process.env.OUTBOX_WORKER_ENABLED === 'true') {
+  outboxWorker = createOutboxWorkerFromEnv({
+    store,
+    logger: outboxLogger,
+    workerId: `server-${process.pid}-${aiStreamOwnerId || 'default'}`,
+    eventTypes: ['ai.run_requested'],
+    handlers: {
+      'ai.run_requested': event => executeQueuedAssistantRun(event.payload, {
+        io,
+        store,
+        socketLogger,
+        openaiLogger,
+        normalizeAIModel,
+        getAIClientForModel,
+        aiStreamOwnerId,
+        assemblyAIApiKey,
+        cocoSessionService,
+        cocoAccess,
+      }),
+    },
+  });
+  infrastructureReady
+    .then(() => outboxWorker?.start())
+    .catch(error => {
+      outboxLogger.error('Outbox worker did not start because infrastructure initialization failed', { error });
+    });
+} else {
+  outboxLogger.info('Outbox worker disabled', { enabled: false });
+}
+
 loadStickerCatalog();
+
+if (cocoModelGateway) {
+  registerCocoModelGatewayRoutes(
+    app,
+    cocoModelGateway,
+    DEFAULT_COCO_MODEL_GATEWAY_BASE_PATH,
+    process.env.COCO_MODEL_GATEWAY_BODY_LIMIT || DEFAULT_COCO_MODEL_GATEWAY_BODY_LIMIT,
+  );
+}
 
 registerApiRoutes(app, {
   store,
@@ -197,6 +381,10 @@ registerApiRoutes(app, {
   persistenceStore: activePersistenceStore,
   mediaObjectStorage,
   audioTranscriptionRunner,
+  cocoAccess,
+  cocoMode: cocoRuntimeConfig.mode,
+  cocoAvailableModes: cocoRuntimeConfig.availableModes,
+  cocoDefaultMode: cocoRuntimeConfig.defaultMode,
 });
 
 // Catch-all 路由，返回前端应用的入口 HTML 文件（支持前端路由）
@@ -206,13 +394,25 @@ app.get('*', (req: Request, res: Response) => {
 });
 
 // 全局错误处理中间件
-app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
+type HttpError = Error & {
+  status?: number;
+  statusCode?: number;
+  type?: string;
+};
+
+app.use((err: HttpError, req: Request, res: Response, next: NextFunction) => {
   const errorLogger = new Logger('Error');
   errorLogger.error('Unhandled application error', { error: err.message, stack: err.stack, path: req.path, method: req.method, ip: req.ip });
-  
-  res.status(500).json({ 
-    error: 'Internal server error',
-    message: process.env.NODE_ENV === 'production' ? 'An unexpected error occurred' : err.message
+
+  const statusCode = Number.isInteger(err.status) ? err.status as number : err.statusCode || 500;
+  const safeStatusCode = statusCode >= 400 && statusCode < 600 ? statusCode : 500;
+  const isPayloadTooLarge = safeStatusCode === 413 || err.type === 'entity.too.large';
+
+  res.status(isPayloadTooLarge ? 413 : safeStatusCode).json({
+    error: isPayloadTooLarge ? 'Payload too large' : 'Internal server error',
+    message: process.env.NODE_ENV === 'production'
+      ? (isPayloadTooLarge ? 'Request payload is too large' : 'An unexpected error occurred')
+      : err.message
   });
 });
 
@@ -231,6 +431,14 @@ process.on('unhandledRejection', (reason, promise) => {
     reason: reason instanceof Error ? reason.message : reason,
     stack: reason instanceof Error ? reason.stack : 'No stack trace available'
   });
+});
+
+process.on('SIGTERM', () => {
+  outboxWorker?.stop();
+});
+
+process.on('SIGINT', () => {
+  outboxWorker?.stop();
 });
 
 // ---------------------- 启动服务器 ----------------------

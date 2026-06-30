@@ -1,4 +1,4 @@
-import { AICost, MediaAsset, Message, Room, RoomAICostTotal, RoomMember, RoomMemberRole, RoomMessagePage, RoomOnlineMember, RoomPostingSchedule } from '../types';
+import { AICost, AIModelProvider, MediaAsset, Message, Room, RoomAICostTotal, RoomMember, RoomMemberRole, RoomMessagePage, RoomOnlineMember, RoomPostingSchedule, RoomSandboxStatus } from '../types';
 import { InterruptedStreamingMessageRecoveryOptions } from '../services/aiStreamRecovery';
 
 export const DEFAULT_ROOM_MESSAGE_PAGE_LIMIT = 80;
@@ -116,6 +116,75 @@ export interface SavePushSubscriptionInput {
   userAgent?: string;
 }
 
+export type AssistantRunStatus = 'queued' | 'running' | 'complete' | 'error' | 'cancelled';
+
+export interface AssistantRunRecord {
+  id: string;
+  roomId: string;
+  requestedByClientId: string;
+  aiMessageId: string;
+  status: AssistantRunStatus;
+  modelId: string;
+  apiModel: string;
+  provider: AIModelProvider;
+  roleName?: string;
+  userMessageId?: string;
+  systemPrompt?: string;
+  maxContextMessages?: number;
+  retryForMessageId?: string;
+  editedMessageId?: string;
+  error?: string;
+  createdAt: string;
+  queuedAt: string;
+  startedAt?: string;
+  completedAt?: string;
+  updatedAt: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface AssistantRunUpdate {
+  status?: AssistantRunStatus;
+  error?: string | null;
+  startedAt?: string | null;
+  completedAt?: string | null;
+  updatedAt?: string;
+  metadata?: Record<string, unknown> | null;
+}
+
+export type OutboxEventStatus = 'pending' | 'processing' | 'processed' | 'failed';
+
+export interface OutboxEventRecord {
+  id: string;
+  eventType: string;
+  aggregateType: string;
+  aggregateId: string;
+  roomId?: string;
+  payload: Record<string, unknown>;
+  status: OutboxEventStatus;
+  attempts: number;
+  availableAt: string;
+  lockedAt?: string;
+  lockedBy?: string;
+  processedAt?: string;
+  lastError?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface OutboxClaimOptions {
+  workerId: string;
+  eventTypes?: string[];
+  limit?: number;
+  now?: string;
+  lockMs?: number;
+}
+
+export interface OutboxFailOptions {
+  retryDelayMs?: number;
+  maxAttempts?: number;
+  now?: string;
+}
+
 export type ClientAuthMethod = 'password' | 'google';
 
 export interface ClientAuthTokenRecord {
@@ -163,6 +232,7 @@ export interface RoomSettingsUpdate {
 export interface DurableRoomStore {
   generateUniqueRoomId(): Promise<string>;
   appendMessage(message: Message): Promise<Room | null>;
+  appendMessageWithAtomicPosition(message: Message): Promise<Room | null>;
   appendMediaMessageWithAsset(message: Message, asset: MediaAsset): Promise<MediaMessageAppendResult | null>;
   upsertMessage(message: Message): Promise<Room | null>;
   updateMessageContent(roomId: string, messageId: string, updatedContent: string, updatedAt?: string): Promise<MessageUpdateResult | null>;
@@ -190,6 +260,14 @@ export interface DurableRoomStore {
   updateAudioTranscription(assetId: string, updates: AudioTranscriptionUpdate): Promise<AudioTranscriptionRecord | null>;
   readRoomAICost(roomId: string): Promise<RoomAICostTotal>;
   incrementRoomAICost(roomId: string, cost: AICost | null): Promise<RoomAICostTotal>;
+  createAssistantRun?(run: AssistantRunRecord): Promise<AssistantRunRecord | null>;
+  getAssistantRun?(runId: string): Promise<AssistantRunRecord | null>;
+  updateAssistantRun?(runId: string, updates: AssistantRunUpdate): Promise<AssistantRunRecord | null>;
+  createOutboxEvent?(event: OutboxEventRecord): Promise<OutboxEventRecord | null>;
+  createAssistantRunWithOutbox?(run: AssistantRunRecord, event: OutboxEventRecord): Promise<{ run: AssistantRunRecord; event: OutboxEventRecord } | null>;
+  claimOutboxEvents?(options: OutboxClaimOptions): Promise<OutboxEventRecord[]>;
+  markOutboxEventProcessed?(eventId: string, processedAt?: string): Promise<OutboxEventRecord | null>;
+  markOutboxEventFailed?(eventId: string, error: string, options?: OutboxFailOptions): Promise<OutboxEventRecord | null>;
   saveRoom(room: Room): Promise<Room | null>;
   addRoomMember(roomId: string, clientId: string, role: RoomMemberRole, joinedAt?: string): Promise<RoomMember | null>;
   removeRoomMember(roomId: string, clientId: string): Promise<boolean>;
@@ -221,6 +299,9 @@ export interface DurableRoomStore {
   updateRoomName(roomId: string, creatorId: string, name: string): Promise<Room | null>;
   deleteRoom(roomId: string, creatorId: string): Promise<void>;
   countRooms(): Promise<number>;
+  compareAndSetRoomSandboxStatus(roomId: string, expectedStatuses: RoomSandboxStatus[], nextStatus: RoomSandboxStatus, updatedAt?: string): Promise<Room | null>;
+  findInterruptedCocoRooms(): Promise<Room[]>;
+  findDanglingToolCalls(): Promise<Message[]>;
   // Durable client profile data. Nicknames live in the durable store so they
   // survive Redis flushes; presence (who is online) stays in the realtime store.
   setClientNickname(clientId: string, nickname: string): Promise<void>;
@@ -288,6 +369,14 @@ export class CompositeRoomStore implements RoomStore {
 
   async appendMessage(message: Message) {
     const updatedRoom = await this.durableStore.appendMessage(message);
+    if (updatedRoom) {
+      await this.invalidateRoomMessagesCache(message.roomId);
+    }
+    return updatedRoom;
+  }
+
+  async appendMessageWithAtomicPosition(message: Message) {
+    const updatedRoom = await this.durableStore.appendMessageWithAtomicPosition(message);
     if (updatedRoom) {
       await this.invalidateRoomMessagesCache(message.roomId);
     }
@@ -466,6 +555,38 @@ export class CompositeRoomStore implements RoomStore {
     return this.durableStore.incrementRoomAICost(roomId, cost);
   }
 
+  createAssistantRun(run: AssistantRunRecord) {
+    return this.durableStore.createAssistantRun?.(run) || Promise.resolve(null);
+  }
+
+  getAssistantRun(runId: string) {
+    return this.durableStore.getAssistantRun?.(runId) || Promise.resolve(null);
+  }
+
+  updateAssistantRun(runId: string, updates: AssistantRunUpdate) {
+    return this.durableStore.updateAssistantRun?.(runId, updates) || Promise.resolve(null);
+  }
+
+  createOutboxEvent(event: OutboxEventRecord) {
+    return this.durableStore.createOutboxEvent?.(event) || Promise.resolve(null);
+  }
+
+  createAssistantRunWithOutbox(run: AssistantRunRecord, event: OutboxEventRecord) {
+    return this.durableStore.createAssistantRunWithOutbox?.(run, event) || Promise.resolve(null);
+  }
+
+  claimOutboxEvents(options: OutboxClaimOptions) {
+    return this.durableStore.claimOutboxEvents?.(options) || Promise.resolve([]);
+  }
+
+  markOutboxEventProcessed(eventId: string, processedAt?: string) {
+    return this.durableStore.markOutboxEventProcessed?.(eventId, processedAt) || Promise.resolve(null);
+  }
+
+  markOutboxEventFailed(eventId: string, error: string, options?: OutboxFailOptions) {
+    return this.durableStore.markOutboxEventFailed?.(eventId, error, options) || Promise.resolve(null);
+  }
+
   saveRoom(room: Room) {
     return this.durableStore.saveRoom(room);
   }
@@ -589,6 +710,18 @@ export class CompositeRoomStore implements RoomStore {
 
   countRooms() {
     return this.durableStore.countRooms();
+  }
+
+  compareAndSetRoomSandboxStatus(roomId: string, expectedStatuses: RoomSandboxStatus[], nextStatus: RoomSandboxStatus, updatedAt?: string) {
+    return this.durableStore.compareAndSetRoomSandboxStatus(roomId, expectedStatuses, nextStatus, updatedAt);
+  }
+
+  findInterruptedCocoRooms() {
+    return this.durableStore.findInterruptedCocoRooms();
+  }
+
+  findDanglingToolCalls() {
+    return this.durableStore.findDanglingToolCalls();
   }
 
   async resetAllDataForTests() {

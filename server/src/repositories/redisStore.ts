@@ -1,9 +1,9 @@
 import { customAlphabet } from 'nanoid';
 import { RedisClientType } from 'redis';
 import { Logger } from '../logger';
-import { AICost, MediaAsset, Message, MessageMediaAsset, Room, RoomAICostTotal, RoomMember, RoomMemberRole, RoomOnlineMember } from '../types';
+import { AICost, MediaAsset, Message, MessageMediaAsset, Room, RoomAICostTotal, RoomMember, RoomMemberRole, RoomOnlineMember, RoomSandboxStatus } from '../types';
 import { getAIStreamOwnerId, InterruptedStreamingMessageRecoveryOptions, stripAIStreamRecoveryMetadata } from '../services/aiStreamRecovery';
-import { AudioTranscriptionRecord, AudioTranscriptionUpdate, ClientAccount, ClientAuthTokenRecord, CreateGoogleAccountInput, DEFAULT_ROOM_MESSAGE_PAGE_LIMIT, GoogleAccountProfile, MediaHistoryPage, MediaHistoryPageCursor, MediaHistoryPageOptions, MediaMessageAppendResult, PendingMediaUpload, PushSubscriptionRecord, RoomMessageCacheStore, RoomMessagePageOptions, RoomSettingsUpdate, RoomStore, SavePushSubscriptionInput } from './store';
+import { AssistantRunRecord, AssistantRunUpdate, AudioTranscriptionRecord, AudioTranscriptionUpdate, ClientAccount, ClientAuthTokenRecord, CreateGoogleAccountInput, DEFAULT_ROOM_MESSAGE_PAGE_LIMIT, GoogleAccountProfile, MediaHistoryPage, MediaHistoryPageCursor, MediaHistoryPageOptions, MediaMessageAppendResult, OutboxClaimOptions, OutboxEventRecord, OutboxFailOptions, PendingMediaUpload, PushSubscriptionRecord, RoomMessageCacheStore, RoomMessagePageOptions, RoomSettingsUpdate, RoomStore, SavePushSubscriptionInput } from './store';
 
 const nanoid = customAlphabet('0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz', 10);
 const DEFAULT_ROOM_MESSAGES_CACHE_TTL_SECONDS = 30;
@@ -16,6 +16,9 @@ const getRoomMediaAssetsTimelineKey = (roomId: string) => `room:${roomId}:media_
 const PENDING_MEDIA_UPLOADS_KEY = 'pending_media_uploads';
 const PENDING_MEDIA_UPLOADS_BY_EXPIRY_KEY = 'pending_media_uploads_by_expiry';
 const AUDIO_TRANSCRIPTIONS_KEY = 'audio_transcriptions';
+const ASSISTANT_RUNS_KEY = 'assistant_runs';
+const OUTBOX_EVENTS_KEY = 'outbox_events';
+const OUTBOX_EVENTS_BY_AVAILABLE_KEY = 'outbox_events_by_available';
 const getSavedRoomsKey = (clientId: string) => `user:${clientId}:saved_rooms`;
 const getRoomSavedByKey = (roomId: string) => `room:${roomId}:saved_by`;
 const getRoomPasswordHashKey = (roomId: string) => `room:${roomId}:password_hash`;
@@ -255,6 +258,19 @@ for i = 3, #ARGV do
   redis.call('RPUSH', KEYS[2], ARGV[i])
 end
 return { 1, #ARGV - 2, cjson.encode(room) }
+`;
+
+const REPLACE_MESSAGE_LIST_ONLY_SCRIPT = `
+local roomJson = redis.call('HGET', KEYS[1], ARGV[1])
+if not roomJson then
+  return { 0, 0 }
+end
+
+redis.call('DEL', KEYS[2])
+for i = 2, #ARGV do
+  redis.call('RPUSH', KEYS[2], ARGV[i])
+end
+return { 1, #ARGV - 1 }
 `;
 
 const UPSERT_MESSAGE_LIST_SCRIPT = `
@@ -786,6 +802,10 @@ export class RedisStore implements RoomStore, RoomMessageCacheStore {
       this.logger.error('Error appending message to Redis', { error, messageId: message.id, roomId: message.roomId });
       return null;
     }
+  }
+
+  async appendMessageWithAtomicPosition(message: Message): Promise<Room | null> {
+    return this.appendMessage(message);
   }
 
   async appendMediaMessageWithAsset(message: Message, asset: MediaAsset): Promise<MediaMessageAppendResult | null> {
@@ -1440,12 +1460,214 @@ export class RedisStore implements RoomStore, RoomMessageCacheStore {
     }
   }
 
+  async createAssistantRun(run: AssistantRunRecord): Promise<AssistantRunRecord | null> {
+    try {
+      await this.redisClient.hSet(ASSISTANT_RUNS_KEY, run.id, JSON.stringify(run));
+      return run;
+    } catch (error) {
+      this.logger.error('Error creating Redis assistant run', { error, runId: run.id, roomId: run.roomId });
+      return null;
+    }
+  }
+
+  async getAssistantRun(runId: string): Promise<AssistantRunRecord | null> {
+    try {
+      const raw = await this.redisClient.hGet(ASSISTANT_RUNS_KEY, runId);
+      return raw ? JSON.parse(raw) as AssistantRunRecord : null;
+    } catch (error) {
+      this.logger.error('Error reading Redis assistant run', { error, runId });
+      return null;
+    }
+  }
+
+  async updateAssistantRun(runId: string, updates: AssistantRunUpdate): Promise<AssistantRunRecord | null> {
+    const current = await this.getAssistantRun(runId);
+    if (!current) {
+      return null;
+    }
+
+    const next: AssistantRunRecord = {
+      ...current,
+      updatedAt: updates.updatedAt || new Date().toISOString(),
+    };
+    if (updates.status !== undefined) {
+      next.status = updates.status;
+    }
+    if (Object.prototype.hasOwnProperty.call(updates, 'error')) {
+      if (updates.error === null || updates.error === undefined) delete next.error;
+      else next.error = updates.error;
+    }
+    if (Object.prototype.hasOwnProperty.call(updates, 'startedAt')) {
+      if (updates.startedAt === null || updates.startedAt === undefined) delete next.startedAt;
+      else next.startedAt = updates.startedAt;
+    }
+    if (Object.prototype.hasOwnProperty.call(updates, 'completedAt')) {
+      if (updates.completedAt === null || updates.completedAt === undefined) delete next.completedAt;
+      else next.completedAt = updates.completedAt;
+    }
+    if (Object.prototype.hasOwnProperty.call(updates, 'metadata')) {
+      if (updates.metadata === null || updates.metadata === undefined) delete next.metadata;
+      else next.metadata = updates.metadata;
+    }
+
+    return this.createAssistantRun(next);
+  }
+
+  async createOutboxEvent(event: OutboxEventRecord): Promise<OutboxEventRecord | null> {
+    try {
+      await this.redisClient.hSet(OUTBOX_EVENTS_KEY, event.id, JSON.stringify(event));
+      await (this.redisClient as any).zAdd(OUTBOX_EVENTS_BY_AVAILABLE_KEY, {
+        score: Date.parse(event.availableAt) || Date.now(),
+        value: event.id,
+      });
+      return event;
+    } catch (error) {
+      this.logger.error('Error creating Redis outbox event', { error, eventId: event.id, eventType: event.eventType });
+      return null;
+    }
+  }
+
+  async createAssistantRunWithOutbox(run: AssistantRunRecord, event: OutboxEventRecord): Promise<{ run: AssistantRunRecord; event: OutboxEventRecord } | null> {
+    const savedRun = await this.createAssistantRun(run);
+    if (!savedRun) {
+      return null;
+    }
+    const savedEvent = await this.createOutboxEvent(event);
+    if (!savedEvent) {
+      return null;
+    }
+    return { run: savedRun, event: savedEvent };
+  }
+
+  async claimOutboxEvents(options: OutboxClaimOptions): Promise<OutboxEventRecord[]> {
+    const nowIso = options.now || new Date().toISOString();
+    const nowMs = Date.parse(nowIso) || Date.now();
+    const lockMs = Math.max(1000, options.lockMs || 60_000);
+    const limit = Math.min(100, Math.max(1, Math.floor(options.limit || 10)));
+    const eventTypeSet = options.eventTypes && options.eventTypes.length > 0 ? new Set(options.eventTypes) : null;
+
+    try {
+      const candidateIds = await (this.redisClient as any).zRangeByScore(
+        OUTBOX_EVENTS_BY_AVAILABLE_KEY,
+        0,
+        nowMs,
+        { LIMIT: { offset: 0, count: limit * 3 } }
+      ) as string[];
+      const claimed: OutboxEventRecord[] = [];
+
+      for (const eventId of candidateIds) {
+        if (claimed.length >= limit) break;
+        const raw = await this.redisClient.hGet(OUTBOX_EVENTS_KEY, eventId);
+        if (!raw) {
+          await (this.redisClient as any).zRem(OUTBOX_EVENTS_BY_AVAILABLE_KEY, eventId);
+          continue;
+        }
+
+        const event = JSON.parse(raw) as OutboxEventRecord;
+        if (eventTypeSet && !eventTypeSet.has(event.eventType)) {
+          continue;
+        }
+        const lockedAtMs = Date.parse(event.lockedAt || '');
+        const lockExpired = Number.isFinite(lockedAtMs) && lockedAtMs + lockMs < nowMs;
+        if (event.status !== 'pending' && !(event.status === 'processing' && lockExpired)) {
+          continue;
+        }
+
+        const next: OutboxEventRecord = {
+          ...event,
+          status: 'processing',
+          attempts: (event.attempts || 0) + 1,
+          lockedAt: nowIso,
+          lockedBy: options.workerId,
+          updatedAt: nowIso,
+        };
+        await this.redisClient.hSet(OUTBOX_EVENTS_KEY, eventId, JSON.stringify(next));
+        claimed.push(next);
+      }
+
+      return claimed;
+    } catch (error) {
+      this.logger.error('Error claiming Redis outbox events', { error, options });
+      return [];
+    }
+  }
+
+  async markOutboxEventProcessed(eventId: string, processedAt = new Date().toISOString()): Promise<OutboxEventRecord | null> {
+    try {
+      const raw = await this.redisClient.hGet(OUTBOX_EVENTS_KEY, eventId);
+      if (!raw) return null;
+      const event = JSON.parse(raw) as OutboxEventRecord;
+      const next: OutboxEventRecord = {
+        ...event,
+        status: 'processed',
+        processedAt,
+        updatedAt: processedAt,
+      };
+      delete next.lockedAt;
+      delete next.lockedBy;
+      delete next.lastError;
+      await this.redisClient.hSet(OUTBOX_EVENTS_KEY, eventId, JSON.stringify(next));
+      await (this.redisClient as any).zRem(OUTBOX_EVENTS_BY_AVAILABLE_KEY, eventId);
+      return next;
+    } catch (error) {
+      this.logger.error('Error marking Redis outbox event processed', { error, eventId });
+      return null;
+    }
+  }
+
+  async markOutboxEventFailed(eventId: string, errorMessage: string, options: OutboxFailOptions = {}): Promise<OutboxEventRecord | null> {
+    const now = options.now || new Date().toISOString();
+    const retryDelayMs = Math.max(0, options.retryDelayMs || 30_000);
+    const maxAttempts = Math.max(1, options.maxAttempts || 10);
+    try {
+      const raw = await this.redisClient.hGet(OUTBOX_EVENTS_KEY, eventId);
+      if (!raw) return null;
+      const event = JSON.parse(raw) as OutboxEventRecord;
+      const terminal = (event.attempts || 0) >= maxAttempts;
+      const availableAt = terminal ? event.availableAt : new Date((Date.parse(now) || Date.now()) + retryDelayMs).toISOString();
+      const next: OutboxEventRecord = {
+        ...event,
+        status: terminal ? 'failed' : 'pending',
+        availableAt,
+        lastError: errorMessage,
+        updatedAt: now,
+      };
+      delete next.lockedAt;
+      delete next.lockedBy;
+      await this.redisClient.hSet(OUTBOX_EVENTS_KEY, eventId, JSON.stringify(next));
+      if (terminal) {
+        await (this.redisClient as any).zRem(OUTBOX_EVENTS_BY_AVAILABLE_KEY, eventId);
+      } else {
+        await (this.redisClient as any).zAdd(OUTBOX_EVENTS_BY_AVAILABLE_KEY, {
+          score: Date.parse(availableAt) || Date.now(),
+          value: eventId,
+        });
+      }
+      return next;
+    } catch (error) {
+      this.logger.error('Error marking Redis outbox event failed', { error, eventId, errorMessage });
+      return null;
+    }
+  }
+
   async saveRoom(room: Room): Promise<Room | null> {
     try {
-      const storedRoom = await this.writeRoomRecord(room.id, room);
-      await this.redisClient.sAdd(`user:${room.creatorId}:rooms`, room.id);
-      await this.addRoomMember(room.id, room.creatorId, 'owner', room.createdAt);
-      this.logger.debug('Room saved to Redis', { roomId: room.id, creatorId: room.creatorId });
+      const existingRoom = room.type === undefined ? await this.getRoomById(room.id) : null;
+      const roomToSave = existingRoom
+        ? {
+          ...room,
+          type: existingRoom.type,
+          sandboxId: room.sandboxId ?? existingRoom.sandboxId,
+          sandboxStatus: room.sandboxStatus ?? existingRoom.sandboxStatus,
+          sandboxUpdatedAt: room.sandboxUpdatedAt ?? existingRoom.sandboxUpdatedAt,
+          cocoSessionId: room.cocoSessionId ?? existingRoom.cocoSessionId,
+          cocoStatus: room.cocoStatus ?? existingRoom.cocoStatus,
+        }
+        : room;
+      const storedRoom = await this.writeRoomRecord(room.id, roomToSave);
+      await this.redisClient.sAdd(`user:${roomToSave.creatorId}:rooms`, room.id);
+      await this.addRoomMember(room.id, roomToSave.creatorId, 'owner', roomToSave.createdAt);
+      this.logger.debug('Room saved to Redis', { roomId: room.id, creatorId: roomToSave.creatorId });
       return storedRoom;
     } catch (error) {
       this.logger.error('Error saving room to Redis', { error, roomId: room.id });
@@ -2286,6 +2508,96 @@ export class RedisStore implements RoomStore, RoomMessageCacheStore {
     }
   }
 
+  async compareAndSetRoomSandboxStatus(
+    roomId: string,
+    expectedStatuses: RoomSandboxStatus[],
+    nextStatus: RoomSandboxStatus,
+    updatedAt = new Date().toISOString()
+  ): Promise<Room | null> {
+    if (expectedStatuses.length === 0) {
+      return null;
+    }
+
+    try {
+      const roomJson = await this.redisClient.hGet('rooms', roomId);
+      if (!roomJson) {
+        return null;
+      }
+
+      const room = JSON.parse(roomJson) as Room;
+      const currentStatus = room.sandboxStatus || 'none';
+      if (!expectedStatuses.includes(currentStatus)) {
+        return null;
+      }
+
+      return await this.writeRoomRecord(roomId, {
+        ...room,
+        sandboxStatus: nextStatus,
+        sandboxUpdatedAt: updatedAt,
+      });
+    } catch (error) {
+      this.logger.error('Error comparing and setting Redis room sandbox status', { error, roomId, expectedStatuses, nextStatus });
+      return null;
+    }
+  }
+
+  async findInterruptedCocoRooms(): Promise<Room[]> {
+    try {
+      const roomValues = await this.redisClient.hVals('rooms');
+      return roomValues
+        .map(value => {
+          try {
+            return JSON.parse(value) as Room;
+          } catch {
+            return null;
+          }
+        })
+        .filter((room): room is Room => Boolean(
+          room
+          && room.type === 'coco'
+          && (room.sandboxStatus === 'creating' || room.cocoStatus === 'running')
+        ));
+    } catch (error) {
+      this.logger.error('Error finding interrupted Redis Coco rooms', { error });
+      return [];
+    }
+  }
+
+  async findDanglingToolCalls(): Promise<Message[]> {
+    try {
+      const roomIds = await this.redisClient.hKeys('rooms');
+      const dangling: Message[] = [];
+
+      for (const roomId of roomIds) {
+        const rawMessages = await this.redisClient.lRange(`room:${roomId}:messages`, 0, -1);
+        const messages = rawMessages.flatMap(rawMessage => {
+          try {
+            return [JSON.parse(rawMessage) as Message];
+          } catch {
+            return [];
+          }
+        });
+        const fulfilledCallIds = new Set(
+          messages
+            .filter(message => message.messageType === 'tool_result' && message.toolCallId)
+            .map(message => message.toolCallId!)
+        );
+        dangling.push(
+          ...messages.filter(message => (
+            message.messageType === 'tool_call'
+            && Boolean(message.toolCallId)
+            && !fulfilledCallIds.has(message.toolCallId!)
+          ))
+        );
+      }
+
+      return dangling.sort((first, second) => Date.parse(first.timestamp) - Date.parse(second.timestamp));
+    } catch (error) {
+      this.logger.error('Error finding dangling Redis tool calls', { error });
+      return [];
+    }
+  }
+
   async resetAllDataForTests(): Promise<void> {
     try {
       await this.redisClient.flushDb();
@@ -2322,8 +2634,15 @@ export class RedisStore implements RoomStore, RoomMessageCacheStore {
         });
 
         if (changed) {
-          const updatedRoom = await this.saveMessageHistory(roomId, updatedMessages);
-          if (updatedRoom) {
+          const result = await (this.redisClient as any).eval(REPLACE_MESSAGE_LIST_ONLY_SCRIPT, {
+            keys: ['rooms', `room:${roomId}:messages`],
+            arguments: [
+              roomId,
+              ...updatedMessages.map(message => JSON.stringify(message)),
+            ],
+          });
+          const roomExists = Array.isArray(result) ? Number(result[0]) === 1 : false;
+          if (roomExists) {
             updatedCount += changedCount;
             await this.invalidateRoomMessagesCache(roomId);
           }

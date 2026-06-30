@@ -9,17 +9,33 @@ export interface TestRoom {
   description: string;
   createdAt: string;
   creatorId: string;
+  type?: 'chat' | 'coco';
+  sandboxStatus?: 'none' | 'creating' | 'ready' | 'expired' | 'error';
+  cocoStatus?: 'idle' | 'running' | 'error';
 }
 
 export const uniqueName = (prefix: string) =>
   `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
 export const shortName = (prefix: string) =>
-  `${prefix}-${Math.random().toString(36).slice(2, 8)}`;
+  `${prefix}-${Math.random().toString(36).slice(2, 8)}`.slice(0, 20);
+
+export const fakeAIResponseText = (prompt: string) =>
+  `E2E AI response: I received "${prompt}"`;
 
 export async function resetE2EData(request: APIRequestContext) {
   const response = await request.post(`${serverURL}/api/e2e/reset`);
   expect(response.ok()).toBeTruthy();
+}
+
+export async function expectCocoFeatureEnabled(request: APIRequestContext, clientId: string) {
+  const response = await request.get(`${serverURL}/api/features?clientId=${encodeURIComponent(clientId)}`);
+  expect(response.ok()).toBeTruthy();
+  const features = await response.json();
+  expect(
+    features.coco?.enabled,
+    `Coco E2E tests require the seeded client to be rollout-enabled. clientId=${clientId} response=${JSON.stringify(features.coco)}`,
+  ).toBe(true);
 }
 
 export async function seedClient(context: BrowserContext, clientId = uniqueName('client')) {
@@ -41,14 +57,15 @@ export async function seedClient(context: BrowserContext, clientId = uniqueName(
 export async function createRoomViaApi(
   request: APIRequestContext,
   clientId: string,
-  name = uniqueName('room'),
+  name = shortName('room'),
   description = '',
+  type: 'chat' | 'coco' = 'chat',
 ) {
   const response = await request.post(`${serverURL}/api/clients/${clientId}/rooms`, {
-    data: { name, description },
+    data: { name, description, type },
   });
 
-  expect(response.ok()).toBeTruthy();
+  expect(response.ok(), `create room failed: HTTP ${response.status()} ${await response.text()}`).toBeTruthy();
   return await response.json() as TestRoom;
 }
 

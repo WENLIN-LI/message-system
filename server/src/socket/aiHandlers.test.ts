@@ -1,6 +1,6 @@
 import assert from 'assert/strict';
 import { afterEach, beforeEach, describe, it } from 'node:test';
-import { registerAIHandlers } from './aiHandlers';
+import { executeQueuedAssistantRun, registerAIHandlers } from './aiHandlers';
 import { AIModelOption, Message, Room, RoomAICostTotal } from '../types';
 
 type SocketEmit = {
@@ -154,16 +154,22 @@ const createHarness = (options: {
   model?: AIModelOption;
   aiClientWrapper?: any;
   messages?: Message[];
+  currentRoom?: Room | null;
+  cocoSessionService?: { startTurn: (...args: any[]) => Promise<unknown> };
 } = {}) => {
   const socket = new FakeSocket();
   const io = new FakeIo();
   const store = {
-    rooms: [room()],
+    rooms: options.currentRoom === undefined
+      ? [room()]
+      : (options.currentRoom ? [options.currentRoom] : []),
     members: new Set(['room-1:client-1']),
     messages: options.messages || [message()],
     appendedMessages: [] as Message[],
     upsertedMessages: [] as Message[],
     savedHistories: [] as Message[][],
+    assistantRuns: [] as any[],
+    outboxEvents: [] as any[],
     normalizeAIModelCalls: [] as unknown[],
     truncateBeforeCalls: [] as Array<{ roomId: string; messageId: string }>,
     truncateAfterCalls: [] as Array<{ roomId: string; messageId: string }>,
@@ -278,6 +284,22 @@ const createHarness = (options: {
     async incrementRoomAICost(roomId: string) {
       return roomCost(roomId);
     },
+    async createAssistantRunWithOutbox(run: any, event: any) {
+      this.assistantRuns.push(run);
+      this.outboxEvents.push(event);
+      return { run, event };
+    },
+    async updateAssistantRun(runId: string, updates: any) {
+      const runIndex = this.assistantRuns.findIndex(run => run.id === runId);
+      if (runIndex === -1) {
+        return null;
+      }
+      this.assistantRuns[runIndex] = {
+        ...this.assistantRuns[runIndex],
+        ...updates,
+      };
+      return this.assistantRuns[runIndex];
+    },
   };
 
   registerAIHandlers({
@@ -297,6 +319,7 @@ const createHarness = (options: {
       throw new Error('E2E fake AI should not request a real client');
     },
     aiStreamOwnerId: options.aiStreamOwnerId || 'test-stream-owner',
+    cocoSessionService: options.cocoSessionService as any,
   });
 
   return { io, socket, store };
@@ -306,6 +329,7 @@ describe('AI socket handlers', () => {
   const previousEnv = {
     e2eMode: process.env.E2E_TEST_MODE,
     fakeAI: process.env.E2E_FAKE_AI,
+    aiRunnerMode: process.env.AI_RUNNER_MODE,
   };
 
   beforeEach(() => {
@@ -324,6 +348,12 @@ describe('AI socket handlers', () => {
       delete process.env.E2E_FAKE_AI;
     } else {
       process.env.E2E_FAKE_AI = previousEnv.fakeAI;
+    }
+
+    if (previousEnv.aiRunnerMode === undefined) {
+      delete process.env.AI_RUNNER_MODE;
+    } else {
+      process.env.AI_RUNNER_MODE = previousEnv.aiRunnerMode;
     }
   });
 
@@ -373,6 +403,134 @@ describe('AI socket handlers', () => {
     assert.equal((a2uiUpdateEvents[0].args[0] as any).uiPayload.messages[0].createSurface.catalogId, 'https://a2ui.org/specification/v0_9/basic_catalog.json');
   });
 
+  it('queues AI runs for the outbox worker without calling the provider in worker mode', async () => {
+    process.env.AI_RUNNER_MODE = 'worker';
+    process.env.E2E_FAKE_AI = 'false';
+    const openAIClient = {
+      chat: {
+        completions: {
+          create: () => {
+            throw new Error('provider should not be called while queueing');
+          },
+        },
+      },
+    };
+    const { io, socket, store } = createHarness({
+      aiClientWrapper: { provider: 'deepseek', client: openAIClient },
+    });
+
+    let response: unknown;
+    await socket.invoke('ask_ai', { roomId: 'room-1', model: selectedModel.id, codeAgentMode: 'plan' }, (ack: unknown) => {
+      response = ack;
+    });
+
+    assert.equal(store.upsertedMessages.length, 1);
+    assert.equal(store.upsertedMessages[0].status, 'streaming');
+    assert.equal(store.assistantRuns.length, 1);
+    assert.equal(store.assistantRuns[0].status, 'queued');
+    assert.equal(store.assistantRuns[0].metadata.runnerMode, 'worker');
+    assert.equal(store.outboxEvents.length, 1);
+    assert.equal(store.outboxEvents[0].eventType, 'ai.run_requested');
+    assert.equal(store.outboxEvents[0].status, 'pending');
+    assert.equal(store.outboxEvents[0].attempts, 0);
+    assert.equal(store.outboxEvents[0].payload.runId, store.assistantRuns[0].id);
+    assert.equal(store.outboxEvents[0].payload.aiMessageId, store.upsertedMessages[0].id);
+    assert.equal(io.roomEmits.some(event => event.event === 'new_message'), true);
+    assert.equal(io.roomEmits.some(event => event.event === 'ai_chunk'), false);
+    assert.equal(io.roomEmits.some(event => event.event === 'ai_stream_end'), false);
+    assert.equal(io.roomEmits.some(event => event.event === 'ai_stream_error'), false);
+    assert.deepEqual(response, { success: true, messageId: store.upsertedMessages[0].id });
+  });
+
+  it('routes Coco room AI requests to the Coco session service', async () => {
+    const calls: unknown[][] = [];
+    const cocoSessionService = {
+      async startTurn(...args: unknown[]) {
+        calls.push(args);
+        const callback = args[1] as ((response: { success: boolean; messageId?: string }) => void) | undefined;
+        callback?.({ success: true, messageId: 'coco-ai-1' });
+        return { success: true, messageId: 'coco-ai-1' };
+      },
+    };
+    const { socket, store } = createHarness({
+      currentRoom: room({ type: 'coco' }),
+      cocoSessionService,
+    });
+
+    let response: unknown;
+    await socket.invoke('ask_ai', { roomId: 'room-1', model: selectedModel.id, codeAgentMode: 'plan' }, (ack: unknown) => {
+      response = ack;
+    });
+
+    assert.equal(calls.length, 1);
+    assert.deepEqual(calls[0][0], {
+      roomId: 'room-1',
+      clientId: 'client-1',
+      selectedModel,
+      roleName: undefined,
+      mode: 'plan',
+    });
+    assert.deepEqual(response, { success: true, messageId: 'coco-ai-1' });
+    assert.equal(store.upsertedMessages.length, 0);
+    assert.equal(store.assistantRuns.length, 0);
+    assert.equal(store.outboxEvents.length, 0);
+  });
+
+  it('reports Coco unavailability without falling back to ordinary chat AI', async () => {
+    const { socket, store } = createHarness({ currentRoom: room({ type: 'coco' }) });
+
+    let response: unknown;
+    await socket.invoke('ask_ai', { roomId: 'room-1', model: selectedModel.id }, (ack: unknown) => {
+      response = ack;
+    });
+
+    assert.deepEqual(response, { success: false, error: 'Coco is unavailable' });
+    assert.equal(store.upsertedMessages.length, 0);
+    assert.equal(store.assistantRuns.length, 0);
+  });
+
+  it('executes a queued AI run from the outbox worker path', async () => {
+    const { io, store } = createHarness();
+    store.assistantRuns.push({
+      id: 'run-1',
+      status: 'queued',
+      metadata: { runnerMode: 'worker' },
+    });
+
+    await executeQueuedAssistantRun(
+      {
+        runId: 'run-1',
+        roomId: 'room-1',
+        requestedByClientId: 'client-1',
+        aiMessageId: 'queued-ai-message',
+        roleName: 'Assistant',
+        systemPrompt: 'You are helpful.',
+        model: selectedModel.id,
+        maxContextMessages: 100,
+        contextMessages: [message()],
+        historyUsedForContext: [message()],
+      },
+      {
+        io: io as any,
+        store: store as any,
+        socketLogger: logger as any,
+        openaiLogger: logger as any,
+        normalizeAIModel: () => selectedModel,
+        getAIClientForModel: () => {
+          throw new Error('E2E fake worker should not request a real client');
+        },
+      },
+    );
+
+    assert.equal(store.upsertedMessages.at(-1)?.id, 'queued-ai-message');
+    assert.equal(store.upsertedMessages.at(-1)?.status, 'complete');
+    assert.equal(store.assistantRuns[0].status, 'complete');
+    assert.equal(store.assistantRuns[0].metadata.runnerMode, 'worker');
+    assert.equal(io.roomEmits.some(event => event.event === 'ai_chunk'), true);
+    assert.equal(io.roomEmits.some(event => event.event === 'ai_stream_end'), true);
+    assert.equal(io.roomEmits.some(event => event.event === 'ai_stream_error'), false);
+  });
+
   it('uses only the current message when the room AI context limit is zero', async () => {
     process.env.E2E_FAKE_AI = 'false';
     const createCalls: any[] = [];
@@ -411,6 +569,71 @@ describe('AI socket handlers', () => {
     assert.equal(userMessages.length, 1);
     assert.match(String(userMessages[0].content), /current prompt/);
     assert.doesNotMatch(String(userMessages[0].content), /old prompt/);
+  });
+
+  it('does not include the automatic A2UI hi demo trigger for the default assistant role', async () => {
+    process.env.E2E_FAKE_AI = 'false';
+    const createCalls: any[] = [];
+    const openAIClient = {
+      chat: {
+        completions: {
+          create: (request: any) => {
+            createCalls.push(request);
+            return asyncIterable([
+              { choices: [{ delta: { content: 'hello' } }] },
+              { choices: [{ finish_reason: 'stop', delta: {} }], usage: { prompt_tokens: 5, completion_tokens: 1, total_tokens: 6 } },
+            ]);
+          },
+        },
+      },
+    };
+    const { socket } = createHarness({
+      messages: [message({ content: 'hi' })],
+      aiClientWrapper: { provider: 'deepseek', client: openAIClient },
+    });
+
+    await socket.invoke('ask_ai', {
+      roomId: 'room-1',
+      model: selectedModel.id,
+      roleName: 'Assistant',
+      systemPrompt: 'You are a helpful, creative, friendly assistant. Respond concisely and clearly.',
+    });
+
+    const providerMessages = createCalls[0].messages as Array<{ role: string; content: string }>;
+    assert.match(String(providerMessages[0].content), /A2UI streaming UI capability/);
+    assert.doesNotMatch(String(providerMessages[0].content), /latest user message is exactly "hi"/);
+  });
+
+  it('includes the automatic A2UI hi demo trigger for the A2UI demo role', async () => {
+    process.env.E2E_FAKE_AI = 'false';
+    const createCalls: any[] = [];
+    const openAIClient = {
+      chat: {
+        completions: {
+          create: (request: any) => {
+            createCalls.push(request);
+            return asyncIterable([
+              { choices: [{ delta: { content: 'demo' } }] },
+              { choices: [{ finish_reason: 'stop', delta: {} }], usage: { prompt_tokens: 5, completion_tokens: 1, total_tokens: 6 } },
+            ]);
+          },
+        },
+      },
+    };
+    const { socket } = createHarness({
+      messages: [message({ content: 'hi' })],
+      aiClientWrapper: { provider: 'deepseek', client: openAIClient },
+    });
+
+    await socket.invoke('ask_ai', {
+      roomId: 'room-1',
+      model: selectedModel.id,
+      roleName: 'A2UI Demo',
+      systemPrompt: 'You are an A2UI streaming demo assistant.',
+    });
+
+    const providerMessages = createCalls[0].messages as Array<{ role: string; content: string }>;
+    assert.match(String(providerMessages[0].content), /latest user message is exactly "hi"/);
   });
 
   it('streams A2UI updates from OpenAI-compatible tool calls before stream end', async () => {
@@ -522,6 +745,146 @@ describe('AI socket handlers', () => {
     assert.equal(store.upsertedMessages[1].uiPayload?.messages.length, 2);
     assert.equal(store.upsertedMessages[1].usage?.promptTokens, 20);
     assert.equal(store.upsertedMessages[1].usage?.completionTokens, 10);
+  });
+
+  it('treats premature provider close after streamed content as a completed AI response', async () => {
+    process.env.E2E_FAKE_AI = 'false';
+    const openAIClient = {
+      chat: {
+        completions: {
+          create: () => ({
+            async *[Symbol.asyncIterator]() {
+              yield { choices: [{ delta: { content: 'complete-looking response' } }] };
+              throw new Error('Premature close');
+            },
+          }),
+        },
+      },
+    };
+    const { io, socket, store } = createHarness({
+      aiClientWrapper: { provider: 'deepseek', client: openAIClient },
+    });
+
+    await socket.invoke('ask_ai', { roomId: 'room-1', model: selectedModel.id });
+
+    assert.equal(store.upsertedMessages.length, 2);
+    assert.equal(store.upsertedMessages[0].status, 'streaming');
+    assert.equal(store.upsertedMessages[1].status, 'complete');
+    assert.equal(store.upsertedMessages[1].content, 'complete-looking response');
+    assert.equal(store.upsertedMessages[1].usage?.source, 'estimated');
+    assert.equal(io.roomEmits.some(event => event.event === 'ai_stream_error'), false);
+    const streamEnd = io.roomEmits.find(event => event.event === 'ai_stream_end');
+    assert.ok(streamEnd);
+    assert.equal((streamEnd.args[0] as any).content, 'complete-looking response');
+    assert.equal((streamEnd.args[0] as any).completedAfterPrematureClose, true);
+  });
+
+  it('preserves reported usage when a stream closes prematurely after the usage chunk', async () => {
+    process.env.E2E_FAKE_AI = 'false';
+    const openAIClient = {
+      chat: {
+        completions: {
+          create: () => ({
+            async *[Symbol.asyncIterator]() {
+              yield { choices: [{ delta: { content: 'complete-looking response' } }] };
+              yield {
+                choices: [],
+                usage: {
+                  prompt_tokens: 100,
+                  completion_tokens: 10,
+                  total_tokens: 110,
+                  prompt_cache_hit_tokens: 86,
+                  prompt_cache_miss_tokens: 14,
+                },
+              };
+              throw new Error('Premature close');
+            },
+          }),
+        },
+      },
+    };
+    const { io, socket, store } = createHarness({
+      aiClientWrapper: { provider: 'deepseek', client: openAIClient },
+    });
+
+    await socket.invoke('ask_ai', { roomId: 'room-1', model: selectedModel.id });
+
+    const finalMessage = store.upsertedMessages[1];
+    assert.equal(finalMessage.status, 'complete');
+    assert.equal(finalMessage.usage?.source, 'reported');
+    assert.equal(finalMessage.usage?.cacheHitRate, 0.86);
+    assert.equal(finalMessage.cost?.estimated, false);
+    const streamEnd = io.roomEmits.find(event => event.event === 'ai_stream_end');
+    assert.ok(streamEnd);
+    assert.equal((streamEnd.args[0] as any).usage.source, 'reported');
+    assert.equal((streamEnd.args[0] as any).completedAfterPrematureClose, true);
+  });
+
+  it('preserves reported usage in the outbox worker when a stream closes prematurely after the usage chunk', async () => {
+    process.env.E2E_FAKE_AI = 'false';
+    const openAIClient = {
+      chat: {
+        completions: {
+          create: () => ({
+            async *[Symbol.asyncIterator]() {
+              yield { choices: [{ delta: { content: 'worker response' } }] };
+              yield {
+                choices: [],
+                usage: {
+                  prompt_tokens: 50,
+                  completion_tokens: 5,
+                  total_tokens: 55,
+                  prompt_cache_hit_tokens: 40,
+                  prompt_cache_miss_tokens: 10,
+                },
+              };
+              throw new Error('Premature close');
+            },
+          }),
+        },
+      },
+    };
+    const { io, store } = createHarness();
+    store.assistantRuns.push({
+      id: 'run-reported-usage',
+      status: 'queued',
+      metadata: { runnerMode: 'worker' },
+    });
+
+    await executeQueuedAssistantRun(
+      {
+        runId: 'run-reported-usage',
+        roomId: 'room-1',
+        requestedByClientId: 'client-1',
+        aiMessageId: 'queued-ai-message',
+        roleName: 'Assistant',
+        systemPrompt: 'You are helpful.',
+        model: selectedModel.id,
+        maxContextMessages: 100,
+        contextMessages: [message()],
+        historyUsedForContext: [message()],
+      },
+      {
+        io: io as any,
+        store: store as any,
+        socketLogger: logger as any,
+        openaiLogger: logger as any,
+        normalizeAIModel: () => selectedModel,
+        getAIClientForModel: () => ({ provider: 'deepseek', client: openAIClient as any }),
+      },
+    );
+
+    const finalMessage = store.upsertedMessages.at(-1);
+    assert.equal(finalMessage?.status, 'complete');
+    assert.equal(finalMessage?.usage?.source, 'reported');
+    assert.equal(finalMessage?.usage?.cacheHitRate, 0.8);
+    assert.equal(finalMessage?.cost?.estimated, false);
+    assert.equal(store.assistantRuns[0].status, 'complete');
+    assert.equal(store.assistantRuns[0].metadata.usage.source, 'reported');
+    const streamEnd = io.roomEmits.find(event => event.event === 'ai_stream_end');
+    assert.ok(streamEnd);
+    assert.equal((streamEnd.args[0] as any).usage.source, 'reported');
+    assert.equal((streamEnd.args[0] as any).completedAfterPrematureClose, true);
   });
 
   it('rejects AI requests from clients without room access', async () => {
@@ -666,6 +1029,75 @@ describe('AI socket handlers', () => {
     assert.deepEqual(response, { success: true, messageId: store.upsertedMessages[0].id });
   });
 
+  it('edits, truncates, and routes Coco edit-and-ask to the Coco session service', async () => {
+    const calls: unknown[][] = [];
+    const cocoSessionService = {
+      async startTurn(...args: unknown[]) {
+        calls.push(args);
+        const callback = args[1] as ((response: { success: boolean; messageId?: string }) => void) | undefined;
+        callback?.({ success: true, messageId: 'coco-ai-edit-1' });
+        return { success: true, messageId: 'coco-ai-edit-1' };
+      },
+    };
+    const { io, socket, store } = createHarness({
+      currentRoom: room({ type: 'coco' }),
+      cocoSessionService,
+    });
+    const editedUser = message({ id: 'message-edited', content: 'original prompt' });
+    const staleTool = message({
+      id: 'tool-stale',
+      clientId: 'coco',
+      content: 'stale tool result',
+      messageType: 'tool_result',
+    });
+    store.messages = [message(), editedUser, staleTool];
+
+    let response: unknown;
+    await socket.invoke('edit_message_and_ask_ai', {
+      roomId: 'room-1',
+      messageId: 'message-edited',
+      newContent: 'edited prompt',
+      model: selectedModel.id,
+      codeAgentMode: 'acceptEdits',
+    }, (ack: unknown) => {
+      response = ack;
+    });
+
+    assert.deepEqual(store.editAndTruncateCalls, [{ roomId: 'room-1', messageId: 'message-edited', newContent: 'edited prompt' }]);
+    assert.equal(store.upsertedMessages.length, 0);
+    assert.equal(calls.length, 1);
+    assert.deepEqual(calls[0][0], {
+      roomId: 'room-1',
+      clientId: 'client-1',
+      selectedModel,
+      roleName: undefined,
+      mode: 'acceptEdits',
+    });
+    const editedEvent = io.roomEmits.find(event => event.event === 'message_edited');
+    assert.equal((editedEvent?.args[0] as Message).content, 'edited prompt');
+    const historyEvent = io.roomEmits.find(event => event.event === 'message_history');
+    const historyPayload = historyEvent?.args[0] as { messages: Message[] };
+    assert.deepEqual(historyPayload.messages.map(item => item.id), ['message-1', 'message-edited']);
+    assert.deepEqual(response, { success: true, messageId: 'coco-ai-edit-1' });
+  });
+
+  it('does not edit Coco messages when the Coco session service is unavailable', async () => {
+    const { socket, store } = createHarness({ currentRoom: room({ type: 'coco' }) });
+
+    let response: unknown;
+    await socket.invoke('edit_message_and_ask_ai', {
+      roomId: 'room-1',
+      messageId: 'message-1',
+      newContent: 'edited prompt',
+      model: selectedModel.id,
+    }, (ack: unknown) => {
+      response = ack;
+    });
+
+    assert.deepEqual(response, { success: false, error: 'Coco is unavailable' });
+    assert.deepEqual(store.editAndTruncateCalls, []);
+  });
+
   it('saves a user message before starting AI with prepared history', async () => {
     const { io, socket, store } = createHarness();
 
@@ -700,6 +1132,51 @@ describe('AI socket handlers', () => {
     assert.ok(aiPlaceholderEventIndex !== -1);
     assert.ok(userMessageEventIndex < aiPlaceholderEventIndex);
     assert.equal(store.upsertedMessages[1].content, expectedE2EFakeContent('fresh prompt'));
+  });
+
+  it('saves a user message before routing Coco ask requests to the Coco session service', async () => {
+    const calls: unknown[][] = [];
+    const cocoSessionService = {
+      async startTurn(...args: unknown[]) {
+        calls.push(args);
+        const callback = args[1] as ((response: { success: boolean; messageId?: string }) => void) | undefined;
+        callback?.({ success: true, messageId: 'coco-ai-2' });
+        return { success: true, messageId: 'coco-ai-2' };
+      },
+    };
+    const { io, socket, store } = createHarness({
+      currentRoom: room({ type: 'coco' }),
+      cocoSessionService,
+    });
+
+    let response: { success: boolean; userMessage?: Message; aiMessageId?: string; aiStarted?: boolean; aiError?: string } | undefined;
+    await socket.invoke('send_message_and_ask_ai', {
+      roomId: 'room-1',
+      content: 'fresh prompt',
+      clientMessageId: 'client-message-1',
+      model: selectedModel.id,
+      codeAgentMode: 'acceptEdits',
+    }, (ack: { success: boolean; userMessage?: Message; aiMessageId?: string; aiStarted?: boolean; aiError?: string }) => {
+      response = ack;
+    });
+
+    assert.equal(store.appendedMessages.length, 1);
+    assert.equal(store.upsertedMessages.length, 0);
+    assert.equal(calls.length, 1);
+    assert.deepEqual(calls[0][0], {
+      roomId: 'room-1',
+      clientId: 'client-1',
+      selectedModel,
+      roleName: undefined,
+      mode: 'acceptEdits',
+    });
+    assert.equal(response?.success, true);
+    assert.equal(response?.userMessage, store.appendedMessages[0]);
+    assert.equal(response?.aiMessageId, 'coco-ai-2');
+    assert.equal(response?.aiStarted, true);
+    assert.equal(io.roomEmits.some(event =>
+      event.event === 'new_message' && (event.args[0] as Message).id === store.appendedMessages[0].id
+    ), true);
   });
 
   it('acknowledges the saved user message when AI startup fails afterward', async () => {
