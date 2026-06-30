@@ -108,6 +108,48 @@ describe('PublishedStaticSiteService', () => {
     assert.equal(spaFallback?.file.path, 'index.html');
   });
 
+  it('lists published artifacts for a room from stored manifests', async () => {
+    const ids = [
+      'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+      'bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee',
+    ];
+    const { service } = createService({ createId: () => ids.shift() || 'cccccccc-bbbb-cccc-dddd-eeeeeeeeeeee' });
+    const claims = service.verifyTurnToken(service.issueTurnToken({
+      roomId: 'room-1',
+      clientId: 'client-1',
+      turnId: 'turn-1',
+      mode: 'acceptEdits',
+    }))!;
+
+    await service.publish({
+      roomId: 'room-1',
+      turnId: 'turn-1',
+      slug: 'first-demo',
+      title: 'First Demo',
+      entry: 'index.html',
+      files: [textFile('index.html', '<!doctype html>first')],
+    }, claims);
+    await service.publish({
+      roomId: 'room-1',
+      turnId: 'turn-1',
+      slug: 'second-demo',
+      title: 'Second Demo',
+      entry: 'index.html',
+      files: [textFile('index.html', '<!doctype html>second')],
+    }, claims);
+
+    const artifacts = await service.listSitesForRoom('room-1', 'https://ai-chat.wenlin.dev/room/abc');
+
+    assert.deepEqual(artifacts.map(artifact => artifact.slug), ['first-demo', 'second-demo']);
+    assert.deepEqual(artifacts.map(artifact => artifact.title), ['First Demo', 'Second Demo']);
+    assert.deepEqual(artifacts.map(artifact => artifact.url), [
+      'https://ai-chat.wenlin.dev/p/first-demo/',
+      'https://ai-chat.wenlin.dev/p/second-demo/',
+    ]);
+    assert.equal(artifacts[0].fileCount, 1);
+    assert.equal(artifacts[0].entry, 'index.html');
+  });
+
   it('uses an allowed production client origin for publish URLs', () => {
     const { service } = createService({
       publicBaseUrl: 'https://ai-chat.wenlin.dev',
