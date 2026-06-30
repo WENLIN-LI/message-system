@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "artifactName": "message-system-coco",
-  "artifactVersion": "message-system-coco-2026-06-30-static-publish",
+  "artifactVersion": "message-system-coco-2026-06-30-workspace-prompt",
   "pythonVersion": "3.12",
   "baseImage": {
     "name": "python",
