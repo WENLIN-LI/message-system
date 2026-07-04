@@ -13,6 +13,7 @@ dependencies = []
 message-system-coco-runner = "message-system_coco_runner.runner:main"
 message-system-codex-cli-runner = "message-system_coco_runner.codex_cli:main"
 message-system-codex-app-server-runner = "message-system_coco_runner.codex_app_server:main"
+message-system-codex-sdk-app-server-runner = "message-system_coco_runner.codex_sdk_app_server:main"
 message-system = "message-system_coco_runner.platform_tools:main"
 
 [tool.setuptools.packages.find]

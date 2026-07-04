@@ -4,7 +4,7 @@ ARG CODEX_CLI_NPM_VERSION=0.142.5
 
 ENV PYTHONUNBUFFERED=1
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1
-ENV MESSAGE_SYSTEM_COCO_ARTIFACT_VERSION=message-system-coco-2026-07-04-codex-permission-mapping-v2
+ENV MESSAGE_SYSTEM_COCO_ARTIFACT_VERSION=message-system-coco-2026-07-04-codex-sdk-app-server-poc-v3
 ENV MESSAGE_SYSTEM_COCO_SOURCE_REF=a4e70e674e46d59a63874371276f5fec0fcd3f41
 ENV MESSAGE_SYSTEM_CODEX_CLI_VERSION=${CODEX_CLI_NPM_VERSION}
 ENV PYTHONPATH=/opt/coco/src:/opt/message-system_coco_runner
@@ -15,6 +15,7 @@ COPY coco /opt/coco
 COPY message-system_coco_runner /opt/message-system_coco_runner
 COPY artifact.lock.json /opt/message-system-coco-artifact.lock.json
 COPY requirements.lock /opt/message-system-coco-requirements.lock
+COPY codex-sdk.requirements.lock /opt/message-system-codex-sdk-requirements.lock
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends ca-certificates curl gnupg git bash bubblewrap \
@@ -33,7 +34,8 @@ RUN apt-get update \
   && codex-linux-sandbox --help >/dev/null \
   && message-system --help >/dev/null \
   && python -m pip install --no-cache-dir --require-hashes -r /opt/message-system-coco-requirements.lock \
-  && python -c 'import importlib; importlib.import_module("core.engine"); importlib.import_module("message-system_coco_runner.runner"); importlib.import_module("message-system_coco_runner.codex_cli"); importlib.import_module("message-system_coco_runner.codex_app_server")' \
+  && python -m pip install --no-cache-dir --no-deps --require-hashes -r /opt/message-system-codex-sdk-requirements.lock \
+  && python -c 'import importlib; importlib.import_module("core.engine"); importlib.import_module("message-system_coco_runner.runner"); importlib.import_module("message-system_coco_runner.codex_cli"); importlib.import_module("message-system_coco_runner.codex_app_server"); importlib.import_module("message-system_coco_runner.codex_sdk_app_server"); importlib.import_module("openai_codex")' \
   && apt-get purge -y --auto-remove curl gnupg \
   && apt-get clean \
   && rm -rf /var/lib/apt/lists/*
