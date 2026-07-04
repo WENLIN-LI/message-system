@@ -4,7 +4,7 @@ ARG CODEX_CLI_NPM_VERSION=0.142.5
 
 ENV PYTHONUNBUFFERED=1
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1
-ENV MESSAGE_SYSTEM_COCO_ARTIFACT_VERSION=message-system-coco-2026-07-04-codex-message-system-tools
+ENV MESSAGE_SYSTEM_COCO_ARTIFACT_VERSION=message-system-coco-2026-07-04-codex-app-server
 ENV MESSAGE_SYSTEM_COCO_SOURCE_REF=a4e70e674e46d59a63874371276f5fec0fcd3f41
 ENV MESSAGE_SYSTEM_CODEX_CLI_VERSION=${CODEX_CLI_NPM_VERSION}
 ENV PYTHONPATH=/opt/coco/src:/opt/message-system_coco_runner
@@ -33,7 +33,7 @@ RUN apt-get update \
   && codex-linux-sandbox --help >/dev/null \
   && message-system --help >/dev/null \
   && python -m pip install --no-cache-dir --require-hashes -r /opt/message-system-coco-requirements.lock \
-  && python -c 'import importlib; importlib.import_module("core.engine"); importlib.import_module("message-system_coco_runner.runner"); importlib.import_module("message-system_coco_runner.codex_cli")' \
+  && python -c 'import importlib; importlib.import_module("core.engine"); importlib.import_module("message-system_coco_runner.runner"); importlib.import_module("message-system_coco_runner.codex_cli"); importlib.import_module("message-system_coco_runner.codex_app_server")' \
   && apt-get purge -y --auto-remove curl gnupg \
   && apt-get clean \
   && rm -rf /var/lib/apt/lists/*
