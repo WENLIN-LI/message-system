@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "artifactName": "message-system-coco",
-  "artifactVersion": "message-system-coco-2026-07-04-dual-cli-candidate",
+  "artifactVersion": "message-system-coco-2026-07-04-codex-message-system-tools",
   "pythonVersion": "3.12",
   "baseImage": {
     "name": "python",
@@ -16,7 +16,7 @@
   },
   "runner": {
     "packageName": "message-system-coco-runner",
-    "packageVersion": "0.1.2",
+    "packageVersion": "0.1.3",
     "sourcePath": "server/message-system_coco_runner",
     "command": "python -m message-system_coco_runner",
     "backends": {
