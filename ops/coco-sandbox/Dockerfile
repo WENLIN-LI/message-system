@@ -1,9 +1,12 @@
 FROM python:3.12-slim-bookworm@sha256:42ada43c4265e1ed6db62ad8df62af99a4abb9a9d49622032522ac76efb0bcef
 
+ARG CODEX_CLI_NPM_VERSION=0.142.5
+
 ENV PYTHONUNBUFFERED=1
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1
-ENV MESSAGE_SYSTEM_COCO_ARTIFACT_VERSION=message-system-coco-2026-06-30-workspace-prompt
+ENV MESSAGE_SYSTEM_COCO_ARTIFACT_VERSION=message-system-coco-2026-07-04-dual-cli-candidate
 ENV MESSAGE_SYSTEM_COCO_SOURCE_REF=a4e70e674e46d59a63874371276f5fec0fcd3f41
+ENV MESSAGE_SYSTEM_CODEX_CLI_VERSION=${CODEX_CLI_NPM_VERSION}
 ENV PYTHONPATH=/opt/coco/src:/opt/message-system_coco_runner
 
 WORKDIR /workspace
@@ -13,11 +16,25 @@ COPY message-system_coco_runner /opt/message-system_coco_runner
 COPY artifact.lock.json /opt/message-system-coco-artifact.lock.json
 COPY requirements.lock /opt/message-system-coco-requirements.lock
 
-RUN python -m pip install --no-cache-dir --require-hashes -r /opt/message-system-coco-requirements.lock \
-  && python -c 'import importlib; importlib.import_module("core.engine"); importlib.import_module("message-system_coco_runner.runner")'
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends ca-certificates curl gnupg git bash bubblewrap \
+  && mkdir -p /etc/apt/keyrings \
+  && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
+  && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" > /etc/apt/sources.list.d/nodesource.list \
+  && apt-get update \
+  && apt-get install -y --no-install-recommends nodejs \
+  && npm install -g @openai/codex@${CODEX_CLI_NPM_VERSION} \
+  && codex --version \
+  && python -m pip install --no-cache-dir --require-hashes -r /opt/message-system-coco-requirements.lock \
+  && python -c 'import importlib; importlib.import_module("core.engine"); importlib.import_module("message-system_coco_runner.runner"); importlib.import_module("message-system_coco_runner.codex_cli")' \
+  && apt-get purge -y --auto-remove curl gnupg \
+  && apt-get clean \
+  && rm -rf /var/lib/apt/lists/*
 
 RUN useradd --create-home --uid 10001 message-system \
-  && chown -R message-system:message-system /workspace
+  && mkdir -p /tmp/message-system-codex \
+  && chown -R message-system:message-system /workspace /tmp/message-system-codex \
+  && chmod 700 /tmp/message-system-codex
 
 USER message-system
 CMD ["python", "-m", "message-system_coco_runner"]

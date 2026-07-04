@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "artifactName": "message-system-coco",
-  "artifactVersion": "message-system-coco-2026-06-30-workspace-prompt",
+  "artifactVersion": "message-system-coco-2026-07-04-dual-cli-candidate",
   "pythonVersion": "3.12",
   "baseImage": {
     "name": "python",
@@ -16,9 +16,18 @@
   },
   "runner": {
     "packageName": "message-system-coco-runner",
-    "packageVersion": "0.1.1",
+    "packageVersion": "0.1.2",
     "sourcePath": "server/message-system_coco_runner",
-    "command": "python -m message-system_coco_runner"
+    "command": "python -m message-system_coco_runner",
+    "backends": {
+      "coco_cli": {
+        "command": "python -m message-system_coco_runner"
+      },
+      "codex_cli": {
+        "command": "python -m message-system_coco_runner.codex_cli",
+        "codexCliVersion": "0.142.5"
+      }
+    }
   },
   "image": {
     "dockerfile": "ops/coco-sandbox/Dockerfile",
