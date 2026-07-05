@@ -920,7 +920,7 @@ export class CodeAgentModelGateway {
       headers.authorization = `Bearer ${providerKey}`;
       if (provider === 'openrouter') {
         headers['HTTP-Referer'] = req.header('HTTP-Referer') || req.header('Referer') || 'https://room.ruit.me';
-        headers['X-Title'] = 'Message System Code Agent';
+        headers['X-Title'] = 'Message System Coco Agent';
       }
     }
     return headers;

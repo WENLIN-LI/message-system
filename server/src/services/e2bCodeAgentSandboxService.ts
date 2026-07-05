@@ -164,7 +164,7 @@ export class E2BCodeAgentSandboxService implements CodeAgentSandboxService {
       '  git init -b main >/dev/null 2>&1 || git init >/dev/null',
       'fi',
       'git config user.email "message-system-code-agent@example.invalid"',
-      'git config user.name "Message System Code Agent"',
+      'git config user.name "Message System Coco Agent"',
       'git add -A',
       'if git rev-parse --verify HEAD >/dev/null 2>&1; then',
       '  if ! git diff --cached --quiet; then',
