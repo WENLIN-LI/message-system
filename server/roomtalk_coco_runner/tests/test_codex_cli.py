@@ -217,6 +217,23 @@ def test_codex_cli_injects_message-system_tool_prompt_and_scoped_shell_env(tmp_p
     assert 'MESSAGE_SYSTEM_CODE_AGENT_TURN_ID = "turn-codex"' in config_toml
     assert 'MESSAGE_SYSTEM_STATIC_PUBLISH_TOKEN = "turn-token"' in config_toml
     assert 'MESSAGE_SYSTEM_E2B_PORT_HOST_TEMPLATE = "{port}.sandbox.e2b.dev"' in config_toml
+    assert f'[projects."{tmp_path}"]' in config_toml
+    assert f'[projects."{workspace}"]' in config_toml
+    assert 'trust_level = "trusted"' in config_toml
+
+
+def test_codex_config_trusts_message-system_workspace_root(tmp_path: Path):
+    codex_home = tmp_path / "codex-home"
+    run_request = parse_request(json.dumps(request(
+        turnId="turn-codex",
+        workspace="/workspace",
+    )))
+
+    codex_cli._write_codex_config(codex_home, run_request, {"COCO_WORKSPACE_ROOT": "/workspace"}, Path("/workspace"))
+
+    config_toml = (codex_home / "config.toml").read_text(encoding="utf-8")
+    assert '[projects."/workspace"]' in config_toml
+    assert 'trust_level = "trusted"' in config_toml
 
 
 def test_codex_cli_passes_requested_model_and_reasoning_effort(tmp_path: Path):
