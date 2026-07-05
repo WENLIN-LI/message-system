@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "message-system-code-agent-runner"
+version = "0.1.9"
+description = "Message System JSONL adapter for code-agent backends"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+message-system-code-agent-runner = "message-system_code_agent_runner.runner:main"
+message-system-codex-cli-runner = "message-system_code_agent_runner.codex_cli:main"
+message-system-codex-app-server-runner = "message-system_code_agent_runner.codex_app_server:main"
+message-system-codex-sdk-app-server-runner = "message-system_code_agent_runner.codex_sdk_app_server:main"
+message-system = "message-system_code_agent_runner.platform_tools:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["message-system_code_agent_runner*"]
