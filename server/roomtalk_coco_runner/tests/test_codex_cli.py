@@ -206,7 +206,9 @@ def test_codex_cli_injects_message-system_tool_prompt_and_scoped_shell_env(tmp_p
     assert 'approval_policy="never"' in call_args
     assert "sandbox_workspace_write.network_access=true" in call_args
     assert "message-system publish-static-site" in call_args[-1]
-    assert "message-system background-shell start" in call_args[-1]
+    assert "frontend build output" in call_args[-1]
+    assert "message-system background-shell" not in call_args[-1]
+    assert "native background terminal" not in call_args[-1]
 
     child_env = call["env"]
     assert "MESSAGE_SYSTEM_STATIC_PUBLISH_TOKEN" not in child_env

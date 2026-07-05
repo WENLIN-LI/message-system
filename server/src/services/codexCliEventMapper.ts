@@ -295,9 +295,6 @@ const message-systemToolName = (command: string) => {
   if (normalized.includes('message-system publish-static-site') || normalized.includes('platform_tools publish-static-site')) {
     return 'PublishStaticSite';
   }
-  if (normalized.includes('message-system background-shell') || normalized.includes('platform_tools background-shell')) {
-    return 'BackgroundShell';
-  }
   return undefined;
 };
 
