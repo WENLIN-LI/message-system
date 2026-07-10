@@ -200,6 +200,8 @@ def test_codex_cli_injects_message-system_tool_prompt_and_scoped_shell_env(tmp_p
             "MESSAGE_SYSTEM_STATIC_PUBLISH_URL": "https://room.example/api/code-agent/publish-static-site",
             "MESSAGE_SYSTEM_STATIC_PUBLISH_PUBLIC_BASE_URL": "https://room.example",
             "MESSAGE_SYSTEM_STATIC_PUBLISH_TOKEN": "turn-token",
+            "MESSAGE_SYSTEM_ROOM_CONTEXT_URL": "https://room.example/api/code-agent/room-context",
+            "MESSAGE_SYSTEM_ROOM_CONTEXT_TOKEN": "room-context-token",
             "MESSAGE_SYSTEM_E2B_PORT_HOST_TEMPLATE": "{port}.sandbox.e2b.dev",
         },
     )
@@ -211,16 +213,21 @@ def test_codex_cli_injects_message-system_tool_prompt_and_scoped_shell_env(tmp_p
     assert 'approval_policy="never"' in call_args
     assert "sandbox_workspace_write.network_access=true" in call_args
     assert "message-system publish-static-site" in call_args[-1]
+    assert "message-system room history --limit 20 --json" in call_args[-1]
+    assert "Message System is the source of truth for room conversation history" in call_args[-1]
     assert "frontend build output" in call_args[-1]
     assert "message-system background-shell" not in call_args[-1]
     assert "native background terminal" not in call_args[-1]
 
     child_env = call["env"]
     assert "MESSAGE_SYSTEM_STATIC_PUBLISH_TOKEN" not in child_env
+    assert "MESSAGE_SYSTEM_ROOM_CONTEXT_TOKEN" not in child_env
     config_toml = (Path(child_env["CODEX_HOME"]) / "config.toml").read_text(encoding="utf-8")
     assert 'MESSAGE_SYSTEM_CODE_AGENT_ROOM_ID = "room-codex"' in config_toml
     assert 'MESSAGE_SYSTEM_CODE_AGENT_TURN_ID = "turn-codex"' in config_toml
     assert 'MESSAGE_SYSTEM_STATIC_PUBLISH_TOKEN = "turn-token"' in config_toml
+    assert 'MESSAGE_SYSTEM_ROOM_CONTEXT_URL = "https://room.example/api/code-agent/room-context"' in config_toml
+    assert 'MESSAGE_SYSTEM_ROOM_CONTEXT_TOKEN = "room-context-token"' in config_toml
     assert 'MESSAGE_SYSTEM_E2B_PORT_HOST_TEMPLATE = "{port}.sandbox.e2b.dev"' in config_toml
     assert f'[projects."{tmp_path}"]' in config_toml
     assert f'[projects."{workspace}"]' in config_toml

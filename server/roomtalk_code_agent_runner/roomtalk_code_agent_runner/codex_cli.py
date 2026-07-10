@@ -482,6 +482,8 @@ def _message-system_tool_env(request: RunnerRequest, env: dict[str, str], worksp
         "MESSAGE_SYSTEM_STATIC_PUBLISH_URL",
         "MESSAGE_SYSTEM_STATIC_PUBLISH_PUBLIC_BASE_URL",
         "MESSAGE_SYSTEM_STATIC_PUBLISH_TOKEN",
+        "MESSAGE_SYSTEM_ROOM_CONTEXT_URL",
+        "MESSAGE_SYSTEM_ROOM_CONTEXT_TOKEN",
         "MESSAGE_SYSTEM_E2B_PORT_HOST_TEMPLATE",
         "MESSAGE_SYSTEM_E2B_PORT_URL_TEMPLATE",
         "CODE_AGENT_PORT_HOST_TEMPLATE",
@@ -509,9 +511,16 @@ def _prompt_with_message-system_tools(request: RunnerRequest, env: dict[str, str
     tool_lines = [
         "Message System sandbox context:",
         f"- {mode_guidance}",
+        f"- Current Message System room: {request.room_id}.",
         "- Keep generated files, downloaded references, and publish roots inside the current workspace.",
         "- This is a non-interactive cloud sandbox. Work within the configured sandbox permissions for this turn.",
     ]
+    if _codex_room_context_enabled(env):
+        tool_lines.extend([
+            "- Message System is the source of truth for room conversation history; the Codex thread may not include messages from before this thread or from other participants.",
+            "- When prior discussion is needed, run `message-system room history --limit 20 --json`. Do not read the full room history by default.",
+            "- To find older discussion, run `message-system room search --query <text> --limit 20 --json`; use `message-system room delta --since <message-id> --json` for messages after a known point.",
+        ])
     if _codex_static_publish_enabled(env):
         tool_lines.extend([
             "- To publish a plain static site or frontend build output, run `message-system publish-static-site --root <dir> --entry index.html` after creating the site directory.",
@@ -529,10 +538,19 @@ def _codex_static_publish_enabled(env: dict[str, str]) -> bool:
     )
 
 
+def _codex_room_context_enabled(env: dict[str, str]) -> bool:
+    return (
+        bool((env.get("MESSAGE_SYSTEM_ROOM_CONTEXT_URL") or "").strip())
+        and bool((env.get("MESSAGE_SYSTEM_ROOM_CONTEXT_TOKEN") or "").strip())
+    )
+
+
 def _message-system_tool_name(command: str) -> str | None:
     normalized = " ".join(command.split()).lower()
     if "message-system publish-static-site" in normalized or "platform_tools publish-static-site" in normalized:
         return PUBLISH_STATIC_SITE_TOOL
+    if "message-system room " in normalized or "platform_tools room " in normalized:
+        return "RoomContext"
     return None
 
 
