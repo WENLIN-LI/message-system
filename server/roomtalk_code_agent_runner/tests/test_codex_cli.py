@@ -225,6 +225,7 @@ def test_codex_cli_injects_message-system_tool_prompt_and_scoped_shell_env(tmp_p
     config_toml = (Path(child_env["CODEX_HOME"]) / "config.toml").read_text(encoding="utf-8")
     assert 'MESSAGE_SYSTEM_CODE_AGENT_ROOM_ID = "room-codex"' in config_toml
     assert 'MESSAGE_SYSTEM_CODE_AGENT_TURN_ID = "turn-codex"' in config_toml
+    assert 'MESSAGE_SYSTEM_CODE_AGENT_CLI_ACCESS = "full"' in config_toml
     assert 'MESSAGE_SYSTEM_STATIC_PUBLISH_TOKEN = "turn-token"' in config_toml
     assert 'MESSAGE_SYSTEM_ROOM_CONTEXT_URL = "https://room.example/api/code-agent/room-context"' in config_toml
     assert 'MESSAGE_SYSTEM_ROOM_CONTEXT_TOKEN = "room-context-token"' in config_toml
@@ -232,6 +233,25 @@ def test_codex_cli_injects_message-system_tool_prompt_and_scoped_shell_env(tmp_p
     assert f'[projects."{tmp_path}"]' in config_toml
     assert f'[projects."{workspace}"]' in config_toml
     assert 'trust_level = "trusted"' in config_toml
+
+
+def test_codex_plan_shell_env_only_exposes_read_only_message-system_capabilities(tmp_path: Path):
+    request = codex_request(tmp_path)
+    values = codex_cli._message-system_tool_env(request, {
+        "CODE_AGENT_WORKSPACE_ROOT": str(tmp_path),
+        "MESSAGE_SYSTEM_ROOM_CONTEXT_URL": "https://room.example/api/code-agent/room-context",
+        "MESSAGE_SYSTEM_ROOM_CONTEXT_TOKEN": "room-context-token",
+        "MESSAGE_SYSTEM_CODE_AGENT_ENABLE_STATIC_PUBLISH": "true",
+        "MESSAGE_SYSTEM_STATIC_PUBLISH_URL": "https://room.example/api/code-agent/publish-static-site",
+        "MESSAGE_SYSTEM_STATIC_PUBLISH_TOKEN": "publish-token",
+        "MESSAGE_SYSTEM_E2B_PORT_HOST_TEMPLATE": "{port}.sandbox.e2b.dev",
+    }, tmp_path)
+
+    assert values["MESSAGE_SYSTEM_CODE_AGENT_CLI_ACCESS"] == "read-only"
+    assert values["MESSAGE_SYSTEM_ROOM_CONTEXT_TOKEN"] == "room-context-token"
+    assert "MESSAGE_SYSTEM_STATIC_PUBLISH_TOKEN" not in values
+    assert "MESSAGE_SYSTEM_STATIC_PUBLISH_URL" not in values
+    assert "MESSAGE_SYSTEM_E2B_PORT_HOST_TEMPLATE" not in values
 
 
 def test_codex_config_trusts_message-system_workspace_root(tmp_path: Path):

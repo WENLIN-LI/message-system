@@ -60,6 +60,13 @@ def test_publish_static_site_command_posts_message-system_payload(tmp_path: Path
     assert [file["path"] for file in posted["payload"]["files"]] == ["index.html"]
 
 
+def test_publish_static_site_is_rejected_by_read_only_cli_access(monkeypatch, capsys):
+    monkeypatch.setenv("MESSAGE_SYSTEM_CODE_AGENT_CLI_ACCESS", "read-only")
+
+    assert platform_tools.main(["publish-static-site", "--json"]) == 1
+    assert json.loads(capsys.readouterr().out)["code"] == "message-system_cli_read_only"
+
+
 @pytest.mark.parametrize(("argv", "expected_suffix"), [
     (["room", "history", "--limit", "12", "--before", "m-20", "--json"], "/history?limit=12&beforeMessageId=m-20"),
     (["room", "delta", "--since", "m-10", "--limit", "30", "--json"], "/delta?sinceMessageId=m-10&limit=30"),

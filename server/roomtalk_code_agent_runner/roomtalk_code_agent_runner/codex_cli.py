@@ -470,27 +470,32 @@ def _trusted_project_paths(workspace: Path, env: dict[str, str]) -> list[str]:
 
 
 def _message-system_tool_env(request: RunnerRequest, env: dict[str, str], workspace: Path) -> dict[str, str]:
+    read_only = _codex_exec_permissions(request).mode == "plan"
     values: dict[str, str] = {
         "MESSAGE_SYSTEM_CODE_AGENT_ROOM_ID": request.room_id,
         "MESSAGE_SYSTEM_CODE_AGENT_TURN_ID": request.turn_id,
+        "MESSAGE_SYSTEM_CODE_AGENT_CLI_ACCESS": "read-only" if read_only else "full",
         "MESSAGE_SYSTEM_WORKSPACE": str(workspace),
     }
-    for key in (
+    read_only_keys = (
         "PYTHONPATH",
         "CODE_AGENT_WORKSPACE_ROOT",
+        "MESSAGE_SYSTEM_ROOM_CONTEXT_URL",
+        "MESSAGE_SYSTEM_ROOM_CONTEXT_TOKEN",
+    )
+    write_keys = (
         "MESSAGE_SYSTEM_CODE_AGENT_ENABLE_STATIC_PUBLISH",
         "MESSAGE_SYSTEM_STATIC_PUBLISH_URL",
         "MESSAGE_SYSTEM_STATIC_PUBLISH_PUBLIC_BASE_URL",
         "MESSAGE_SYSTEM_STATIC_PUBLISH_TOKEN",
-        "MESSAGE_SYSTEM_ROOM_CONTEXT_URL",
-        "MESSAGE_SYSTEM_ROOM_CONTEXT_TOKEN",
         "MESSAGE_SYSTEM_E2B_PORT_HOST_TEMPLATE",
         "MESSAGE_SYSTEM_E2B_PORT_URL_TEMPLATE",
         "CODE_AGENT_PORT_HOST_TEMPLATE",
         "CODE_AGENT_PORT_URL_TEMPLATE",
         "MESSAGE_SYSTEM_CODE_AGENT_BACKGROUND_JOBS_DIR",
         "CODE_AGENT_BACKGROUND_JOBS_DIR",
-    ):
+    )
+    for key in read_only_keys + (() if read_only else write_keys):
         value = (env.get(key) or "").strip()
         if value:
             values[key] = value
