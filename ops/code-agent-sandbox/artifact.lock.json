@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "artifactName": "message-system-code-agent",
-  "artifactVersion": "message-system-code-agent-2026-07-10-room-context-cli-v5",
+  "artifactVersion": "message-system-code-agent-2026-07-10-room-context-cli-v6",
   "pythonVersion": "3.12",
   "baseImage": {
     "name": "python",
@@ -16,7 +16,7 @@
   },
   "runner": {
     "packageName": "message-system-code-agent-runner",
-    "packageVersion": "0.1.17",
+    "packageVersion": "0.1.18",
     "sourcePath": "server/message-system_code_agent_runner",
     "command": "python -m message-system_code_agent_runner",
     "backends": {
