@@ -604,7 +604,7 @@ export class E2BCodeAgentSandboxService implements CodeAgentSandboxService {
       '',
       'workspace = Path(os.environ["MESSAGE_SYSTEM_WORKSPACE"])',
       'archive = os.environ["MESSAGE_SYSTEM_ARCHIVE"]',
-      'skip_dir_names = {".git", "node_modules", ".npm", ".pnpm-store"}',
+      'skip_dir_names = {".git", "node_modules", ".npm", ".npm-cache", ".pnpm-store"}',
       'skipped = 0',
       '',
       'def to_arcname(path: Path) -> str:',
