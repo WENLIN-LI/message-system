@@ -213,7 +213,9 @@ def test_codex_cli_injects_message-system_tool_prompt_and_scoped_shell_env(tmp_p
     assert 'approval_policy="never"' in call_args
     assert "sandbox_workspace_write.network_access=true" not in call_args
     assert 'default_permissions="message-system-room-context-workspace"' in call_args
-    assert "message-system publish-static-site" in call_args[-1]
+    assert "message-system site publish" in call_args[-1]
+    assert "message-system site unpublish" in call_args[-1]
+    assert "message-system site list --json" in call_args[-1]
     assert "message-system room history --limit 20 --json" in call_args[-1]
     assert "Message System is the source of truth for room conversation history" in call_args[-1]
     assert "frontend build output" in call_args[-1]
@@ -375,7 +377,7 @@ def test_codex_cli_maps_message-system_commands_to_platform_tool_events(tmp_path
             "item": {
                 "id": "cmd-publish",
                 "type": "command_execution",
-                "command": "message-system publish-static-site --root site",
+                "command": "message-system site publish --root site",
             },
         }),
         *mapper.map_event({
@@ -388,11 +390,31 @@ def test_codex_cli_maps_message-system_commands_to_platform_tool_events(tmp_path
                 "aggregated_output": "Published static site: https://room.example/p/demo/",
             },
         }),
+        *mapper.map_event({
+            "type": "item.started",
+            "item": {
+                "id": "cmd-unpublish",
+                "type": "command_execution",
+                "command": "message-system site unpublish --slug demo",
+            },
+        }),
+        *mapper.map_event({
+            "type": "item.completed",
+            "item": {
+                "id": "cmd-unpublish",
+                "type": "command_execution",
+                "status": "completed",
+                "exit_code": 0,
+                "aggregated_output": "Unpublished static site: https://room.example/p/demo/",
+            },
+        }),
     ]
 
     assert [event["name"] for event in events if event["type"] in ("tool_call", "tool_result")] == [
         "PublishStaticSite",
         "PublishStaticSite",
+        "UnpublishStaticSite",
+        "UnpublishStaticSite",
     ]
 
 

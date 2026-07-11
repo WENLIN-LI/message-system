@@ -13,7 +13,6 @@ from typing import Any, Callable, Iterable, TextIO
 
 from .runner import (
     EventEmitter,
-    PUBLISH_STATIC_SITE_TOOL,
     RunnerError,
     RunnerRequest,
     parse_request,
@@ -22,6 +21,7 @@ from .runner import (
 from .room_context_broker import start_room_context_broker
 
 SCHEMA_VERSION = 1
+PUBLISH_STATIC_SITE_TOOL = "PublishStaticSite"
 DEFAULT_CODEX_CLI_BIN = "codex"
 DEFAULT_CODEX_SECRET_PARENT = "/tmp/message-system-codex"
 DEFAULT_CODEX_MODEL = "gpt-5.5"
@@ -564,10 +564,12 @@ def _prompt_with_message-system_tools(request: RunnerRequest, env: dict[str, str
             "- Message System is the source of truth for room conversation history; the Codex thread may not include messages from before this thread or from other participants.",
             "- When prior discussion is needed, run `message-system room history --limit 20 --json`. Do not read the full room history by default.",
             "- To find older discussion, run `message-system room search --query <text> --limit 20 --json`; use `message-system room delta --since <message-id> --json` for messages after a known point.",
+            "- To inspect sites published by this room, run `message-system site list --json`.",
         ])
     if _codex_static_publish_enabled(env):
         tool_lines.extend([
-            "- To publish a plain static site or frontend build output, run `message-system publish-static-site --root <dir> --entry index.html` after creating the site directory.",
+            "- To publish a plain static site or frontend build output, run `message-system site publish --root <dir> --entry index.html` after creating the site directory.",
+            "- To take a site offline, run `message-system site unpublish --slug <slug>`. This removes the published site; it does not delete workspace files.",
             "- Use static publishing for HTML/CSS/JS sites and frontend apps that produce static build output.",
             "- Do not use static publishing for apps that require a long-running server process, database, backend API, WebSocket server, or runtime-only framework behavior.",
         ])
@@ -609,7 +611,16 @@ def _codex_room_context_permission_profile(request: RunnerRequest, env: dict[str
 
 def _message-system_tool_name(command: str) -> str | None:
     normalized = " ".join(command.split()).lower()
-    if "message-system publish-static-site" in normalized or "platform_tools publish-static-site" in normalized:
+    if "message-system site list" in normalized or "platform_tools site list" in normalized:
+        return "ListStaticSites"
+    if "message-system site unpublish" in normalized or "platform_tools site unpublish" in normalized:
+        return "UnpublishStaticSite"
+    if (
+        "message-system site publish" in normalized
+        or "platform_tools site publish" in normalized
+        or "message-system publish-static-site" in normalized
+        or "platform_tools publish-static-site" in normalized
+    ):
         return PUBLISH_STATIC_SITE_TOOL
     if "message-system room " in normalized or "platform_tools room " in normalized:
         return "RoomContext"
