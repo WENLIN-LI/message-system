@@ -17,7 +17,7 @@ Message System 是一个以共享房间和可持续工作的沙盒化 Code Agent
 
 ### 沙盒化 Code Agent 房间
 
-- 每个 Code Agent 房间拥有一个共享 E2B 工作区；Coco、Codex CLI 和 Codex app-server 统一接入 Message System turn 协议。
+- 每个 Code Agent 房间拥有一个共享 E2B 工作区，支持 Coco（Message System 自研 CLI coding agent）和 Codex；用户可以连接自己的 Codex 订阅，并通过 Codex CLI/app-server adapter 在共享房间中运行。
 - 沙盒内可复用的 JSONL daemon 顺序执行 turn、流式输出文本/工具/model-step 事件、接收 interrupt/steer 控制，并在沙盒或服务退出时回收。
 - Plan、Edit、Approve for me、Full access 四种权限模式。Plan 使用操作系统强制的只读 Shell；可写模式可以修改 workspace 和运行后台任务。
 - 每个 turn 独立签发 model gateway、room context 和 static publish 凭据。Provider key 与 Message System 服务端 secret 不进入浏览器和 Agent prompt。
