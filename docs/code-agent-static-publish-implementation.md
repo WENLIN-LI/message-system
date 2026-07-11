@@ -124,7 +124,7 @@ The token is not stored in messages and is not sent to the browser.
 
 `message-system_code_agent_runner` adds `PublishStaticSite` when all are true:
 
-- Mode is `acceptEdits`.
+- Mode is Edit, Approve for me, or Full access (`acceptEdits` is treated as the legacy alias for Edit).
 - `MESSAGE_SYSTEM_CODE_AGENT_ENABLE_STATIC_PUBLISH=true`.
 - Publish URL and token are present.
 
