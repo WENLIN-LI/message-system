@@ -527,6 +527,9 @@ def _message-system_tool_env(request: RunnerRequest, env: dict[str, str], worksp
     read_only_keys = (
         "PYTHONPATH",
         "CODE_AGENT_WORKSPACE_ROOT",
+        "MESSAGE_SYSTEM_GITHUB_TOKEN_PATH",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_TERMINAL_PROMPT",
     ) + room_context_keys
     write_keys = (
         "MESSAGE_SYSTEM_CODE_AGENT_ENABLE_STATIC_PUBLISH",

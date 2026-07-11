@@ -463,6 +463,7 @@ const createService = (options: {
   runnerProviderEnvByProvider?: Partial<Record<AIModelOption['provider'], Record<string, string>>>;
   codexBackendEnabled?: boolean;
   codexConnectionService?: any;
+  githubConnectionService?: any;
   mode?: CodeAgentMode;
   availableModes?: CodeAgentMode[];
   defaultMode?: CodeAgentMode;
@@ -514,6 +515,7 @@ const createService = (options: {
       runnerProviderEnvByProvider: options.runnerProviderEnvByProvider,
       codexBackendEnabled: options.codexBackendEnabled,
       codexConnectionService: options.codexConnectionService,
+      githubConnectionService: options.githubConnectionService,
       now: () => new Date('2026-05-03T00:00:00.000Z'),
       createId: () => ids.shift() || 'id-fallback',
       observability: options.observability,
@@ -822,6 +824,18 @@ describe('CodeAgentSessionService', () => {
         const env = sandboxService.startedRunnerEnvs[sandboxService.startedRunnerEnvs.length - 1];
         assert.ok(env.MESSAGE_SYSTEM_CODEX_AUTH_JSON_PATH);
         assert.ok(env.MESSAGE_SYSTEM_CODEX_REFRESHED_AUTH_JSON_PATH);
+        assert.match(env.MESSAGE_SYSTEM_GITHUB_TOKEN_PATH, /^\/tmp\/message-system-codex\/turn-1-github-token$/);
+        assert.match(env.GIT_CONFIG_GLOBAL, /^\/tmp\/message-system-codex\/turn-1-github-gitconfig$/);
+        assert.equal(env.GIT_TERMINAL_PROMPT, '0');
+        assert.equal(JSON.stringify(env).includes('github_pat_test_secret'), false);
+        assert.equal(
+          await sandboxService.readSecretFile(context!.sandbox, env.MESSAGE_SYSTEM_GITHUB_TOKEN_PATH),
+          'github_pat_test_secret'
+        );
+        assert.match(
+          await sandboxService.readSecretFile(context!.sandbox, env.GIT_CONFIG_GLOBAL),
+          /gh auth git-credential/
+        );
         await sandboxService.writeSecretFile(context!.sandbox, {
           path: env.MESSAGE_SYSTEM_CODEX_REFRESHED_AUTH_JSON_PATH,
           content: refreshedAuthJson,
@@ -866,6 +880,12 @@ describe('CodeAgentSessionService', () => {
       runnerCommand: DEFAULT_CODEX_CLI_RUNNER_COMMAND,
       runnerEnv: { PYTHONUNBUFFERED: '1', CODEX_CLI_BIN: '/usr/local/bin/codex' },
       codexConnectionService,
+      githubConnectionService: {
+        async getAccessToken(clientId: string) {
+          assert.equal(clientId, 'client-1');
+          return 'github_pat_test_secret';
+        },
+      },
       ids: ['ai-1', 'turn-1'],
     });
     sandboxService = setup.sandboxService;
@@ -887,6 +907,8 @@ describe('CodeAgentSessionService', () => {
     assert.equal(JSON.stringify(env).includes('initial-access'), false);
     assert.deepEqual(sandboxService.deletedSecretFilePaths.sort(), [
       '/tmp/message-system-codex/turn-1-auth.json',
+      '/tmp/message-system-codex/turn-1-github-gitconfig',
+      '/tmp/message-system-codex/turn-1-github-token',
       '/tmp/message-system-codex/turn-1-refreshed-auth.json',
     ]);
     const messages = setup.store.messages.get('room-1') || [];
