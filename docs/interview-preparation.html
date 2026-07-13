@@ -295,6 +295,8 @@
     <a href="#agent-challenges" class="sub">Code-Agent Challenges</a>
     <a href="#frontend-challenges" class="sub">Frontend Challenges</a>
     <a href="#backend-challenges" class="sub">Backend Challenges</a>
+    <a href="#challenge-deep-dives" class="sub">Deep Implementation Notes</a>
+    <a href="#challenge-followups" class="sub">Follow-Up Bank</a>
     <a href="#scalability">6. Scalability</a>
     <a href="#security">7. Security</a>
     <a href="#testing">8. Testing</a>
@@ -703,6 +705,223 @@ npm run build
         <p><strong>Solution:</strong> Use a coarse-to-fine selection process: reserve space for the system prompt and answer, estimate each message with language-aware rules, then keep the newest useful history that fits. Mixed CJK and Latin text is estimated separately instead of using one characters-per-token ratio.</p>
         <p><strong>Interview takeaway:</strong> Estimation protects reliability; usage accounting provides the final cost truth.</p>
       </div>
+
+      <h3 id="challenge-deep-dives">Deeper Implementation Notes</h3>
+      <p>The cards above are the short answers. Use the following details when an interviewer asks how the design actually works.</p>
+
+      <h4>Code-Agent Turn Flow</h4>
+      <pre><code>Browser sends authenticated prompt
+  -> Node checks global rollout and room-level access
+  -> CodeAgentSessionService creates a durable turn
+  -> sandbox lifecycle creates, reconnects, or resumes E2B
+  -> Node issues separate context/model/publish capabilities
+  -> reusable daemon routes the request to Coco or Codex app-server
+  -> ordered JSONL events return to Node
+  -> Node persists each event position and broadcasts it to the room
+  -> final usage, cost, status, and backend session ID are saved</code></pre>
+
+      <h4>Why Ordered Segments Matter</h4>
+      <pre><code>text A: "I will inspect the directory"
+  -> tool_call: Glob
+  -> tool_result: empty
+  -> text B: "The directory is empty"
+
+Stored as four ordered records, not one merged AI message.</code></pre>
+      <p>If text A and text B are merged first, no timestamp sort can put the tool back between them. The engine and runner must preserve the boundary before Node assigns durable positions.</p>
+
+      <h4>Workspace Transport Choices</h4>
+      <table>
+        <thead><tr><th>Surface</th><th>Transport Model</th><th>Protection</th></tr></thead>
+        <tbody>
+          <tr><td>Files and Git diff</td><td>Socket request plus bounded snapshot</td><td>Room access, path validation, size and truncation limits</td></tr>
+          <tr><td>PTY terminal</td><td>Long-lived session plus byte deltas</td><td>Session ownership, bounded output tail, controlled input</td></tr>
+          <tr><td>Dev preview</td><td>Server-managed preview session</td><td>Target validation, lifecycle control, viewport limits</td></tr>
+          <tr><td>Media assets</td><td>Controlled HTTP asset route</td><td>Room authorization, MIME and size checks</td></tr>
+          <tr><td>Static artifacts</td><td>Versioned object-storage manifest</td><td>Room ownership, slug validation, stable versions</td></tr>
+        </tbody>
+      </table>
+
+      <h4>Sandbox and Daemon Recovery</h4>
+      <ul>
+        <li>One daemon is reused per sandbox, but turns are serialized so two agents do not edit the same workspace concurrently.</li>
+        <li>Daemon startup is locked by sandbox and removes stale runner or Codex child processes before replacement.</li>
+        <li>An active turn extends E2B TTL; completion returns the sandbox to the shorter idle policy.</li>
+        <li>A missing <code>turn_released</code> event cannot block forever because the wait has a timeout and recovery path.</li>
+        <li>On process shutdown, Node reclaims daemons it owns. Durable room, turn, and sandbox identity remain in storage.</li>
+        <li>Artifact upgrades use export, create, import, Git initialization, and an atomic sandbox-ID swap.</li>
+      </ul>
+
+      <h4>Frontend State Machines and Performance</h4>
+      <ul>
+        <li>The media viewer locks a touch gesture into one mode after crossing a threshold; it does not change interpretation halfway through.</li>
+        <li>Double-tap detection uses both time and distance, while swipe dismissal accepts either sufficient distance or velocity.</li>
+        <li>Gesture handlers write pending values. One animation-frame callback batches track, stage, and image transforms.</li>
+        <li>The sticker picker renders the current page and nearby pages instead of all 2,275 stickers.</li>
+        <li>Optimistic messages move through pending, confirmed, or failed states and reconcile by stable IDs.</li>
+        <li>Older-page insertion preserves scroll position using the change in scroll height.</li>
+      </ul>
+
+      <h4>Persistence and Consistency</h4>
+      <ul>
+        <li><code>CompositeRoomStore</code> sends durable operations to Redis or PostgreSQL and realtime presence operations to Redis.</li>
+        <li>The same store contract tests run against both durable implementations to catch behavioral differences.</li>
+        <li>Redis Lua scripts make multi-step membership, version, and delete operations atomic.</li>
+        <li>Room settings use a monotonic version and full-object replacement so stale clients do not merge incompatible fields.</li>
+        <li>PostgreSQL is the source of truth for message pages; Redis cache entries are invalidated only after successful writes.</li>
+      </ul>
+
+      <h3 id="challenge-followups">Technical Challenge Follow-Up Bank</h3>
+      <p>Practice answering the question first, then give the reason and tradeoff. These are intentionally more detailed than the quick cards.</p>
+
+      <details open>
+        <summary>Challenge 1 follow-up: Why not run the agent directly inside the Fly.io app?</summary>
+        <div class="answer">
+          <p>The application server holds trusted state and credentials. Agent commands may install packages, consume CPU, open ports, or execute untrusted repository code. Running both in one process would increase the blast radius of a bad command.</p>
+          <p>E2B provides an isolated execution boundary. Node still owns identity, permissions, durable turns, billing, and lifecycle, so the sandbox cannot grant itself access to another room.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Challenge 2 follow-up: Why not sort tool events by timestamp in the browser?</summary>
+        <div class="answer">
+          <p>The old runner could merge text before and after a tool into one assistant message. The browser could move that whole message, but it could not insert the tool into the lost internal boundary. Also, timestamps can tie or arrive late.</p>
+          <p>The fix belongs where execution order is first known: the engine emits ordered boundaries, the runner forwards them, and Node persists a monotonic position.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Challenge 3 follow-up: Why not place the complete room transcript in every prompt?</summary>
+        <div class="answer">
+          <p>It wastes context tokens, repeats irrelevant content, and may expose internal message fields. Instead, the agent requests bounded history or search results only when needed through the RoomTalk CLI.</p>
+          <p>The runner keeps the real upstream endpoint and token behind a per-turn local broker. The server rechecks room, client, turn, and mode, so possession of a CLI command is not enough to read arbitrary data.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Challenge 3 follow-up: How is Plan mode prevented from modifying the workspace?</summary>
+        <div class="answer">
+          <p>Plan shell uses a read-only mount namespace and blocks direct network access while allowing only the turn's local broker socket. This is stronger than maintaining a list of supposedly safe shell commands, because Python, redirects, and command composition could bypass an incomplete allowlist.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Challenge 4 follow-up: Why do files, PTY, and previews use different protocols?</summary>
+        <div class="answer">
+          <p>A file read is a bounded request with one response. A PTY is interactive and produces an ongoing byte stream. A preview has a target, viewport, lifecycle, and potentially screenshots or recordings. Forcing them into one transport model would either lose capabilities or create an overly complex protocol.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Challenge 5 follow-up: Why is the daemon registry kept in Node memory?</summary>
+        <div class="answer">
+          <p>The registry contains live stdin and stdout handles owned by the current Node process. Those operating-system handles cannot be serialized into PostgreSQL and restored by another process.</p>
+          <p>Room, turn, and sandbox identity are durable. Live handle ownership is recovered through startup cleanup, health checks, bounded waits, and shutdown reclamation. Reconnect metadata could become durable later if E2B provides stable reconnectable command handles.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Challenge 6 follow-up: Why use a gesture state machine?</summary>
+        <div class="answer">
+          <p>The same finger movement can begin as a tap, pan, page swipe, or dismiss gesture. The state machine delays the decision until movement crosses a threshold, chooses a mode from direction and zoom state, and then locks it. Locking avoids a diagonal gesture switching behavior midway.</p>
+          <p>Pinch zoom also preserves the finger midpoint, and animation work is batched through <code>requestAnimationFrame</code> to avoid repeated layout and paint work.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Challenge 7 follow-up: Why cache by asset ID instead of presigned URL?</summary>
+        <div class="answer">
+          <p>A new signed URL may be generated for the same private object, so URL-based keys create duplicate cache entries. The asset ID is stable and represents the logical media object.</p>
+          <p>In-flight Promise deduplication prevents a thundering herd, and LRU eviction limits browser storage. Object URLs must also be revoked when entries are removed to release memory.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Challenge 8 follow-up: Why is <code>100vh</code> unreliable on mobile?</summary>
+        <div class="answer">
+          <p>Mobile browser chrome and the software keyboard change the visible area without always changing the CSS layout viewport in the same way. Safari and Chrome also behave differently.</p>
+          <p>RoomTalk reads Visual Viewport height, keeps a stable baseline, publishes CSS variables, and uses composition guards so Enter does not submit while an IME candidate is still being selected.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Challenge 9 follow-up: Why virtual pages instead of rendering every sticker?</summary>
+        <div class="answer">
+          <p>Thousands of image elements increase DOM work, memory use, decoding, and network requests. Rendering the current page and nearby pages keeps the active DOM small, while adjacent preloading hides most navigation latency.</p>
+          <p>Long-press preview uses a timer and suppresses the following click so lifting a finger after preview does not accidentally send the sticker.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Challenge 10 follow-up: How do optimistic messages avoid duplicates?</summary>
+        <div class="answer">
+          <p>The client creates a pending message with a stable client-generated identity. The server acknowledgement or broadcast is reconciled with that pending record instead of blindly appended. Failure changes the same item to a retryable state.</p>
+          <p>Optimistic rendering improves perceived latency, but the server remains authoritative for final content, status, ordering, and permissions.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Challenge 11 follow-up: Why is mobile recovery multi-layered?</summary>
+        <div class="answer">
+          <p>A dead mobile connection does not always emit <code>disconnect</code>, and reconnect, visibility, online, and page-restore events vary by browser. RoomTalk checks health when any relevant signal appears, but deduplicates concurrent recovery attempts.</p>
+          <p>A reconnect indicator is delayed so a fast healthy rejoin does not flash a spinner. Password verification can be reused within the active session.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Challenge 12 follow-up: How could the Redis-to-PostgreSQL migration be rolled back?</summary>
+        <div class="answer">
+          <p>The durable store is selected by configuration, and migration does not immediately delete the Redis copy. The migration script is idempotent and supports dry-run, so the team can verify counts and rerun safely.</p>
+          <p>Realtime presence stays in Redis in either mode. Only the durable implementation changes, which keeps the rollback boundary small.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Challenge 13 follow-up: Why not use CRDTs for room state?</summary>
+        <div class="answer">
+          <p>CRDTs are valuable when peers must edit independently and merge offline changes. RoomTalk already has a central authority and most room-setting writes are small, online, server-validated operations.</p>
+          <p>A monotonic room version, complete-object replacement, and acknowledgement-based read-your-write behavior solve the actual problem with much less complexity.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Challenge 14 follow-up: What belongs inside an AI provider adapter?</summary>
+        <div class="answer">
+          <p>The adapter translates model names, request options, provider stream events, error types, token usage, and pricing into RoomTalk's internal contract. Socket handlers should not contain provider-specific branches.</p>
+          <p>Normalization makes saved AI messages and recovery provider-neutral, while the adapter still preserves provider-specific capabilities when the internal model supports them.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Challenge 15 follow-up: Why use Redis Lua instead of a Node transaction?</summary>
+        <div class="answer">
+          <p>Separate Redis commands sent from Node can interleave with commands from another server instance. A Lua script executes the checks and writes atomically inside Redis.</p>
+          <p>This is useful for room version increments, per-client socket reference counting, and deleting a message while recomputing room activity. The tradeoff is that scripts require dedicated tests and careful maintenance.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Challenge 16 follow-up: Why are shared contract tests necessary?</summary>
+        <div class="answer">
+          <p>A TypeScript interface checks method shapes, not behavior. Redis and PostgreSQL may disagree on missing records, ordering, duplicate writes, or pagination boundaries while still compiling successfully.</p>
+          <p>The same scenario suite runs against both implementations. Database-specific tests are still useful, but contract tests protect the behavior expected by the rest of the application.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Challenge 17 follow-up: Why invalidate instead of updating cached pages in place?</summary>
+        <div class="answer">
+          <p>A single message change can affect several cached pages, last-message state, reactions, and ordering. Correctly patching every cached shape is complex and easy to get wrong.</p>
+          <p>Invalidation is simpler: the next read reloads from PostgreSQL and repopulates the cache. The tradeoff is one slower read after a write, which is acceptable for stronger correctness.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Challenge 18 follow-up: Why estimate tokens instead of using exact tokenization?</summary>
+        <div class="answer">
+          <p>Providers and models may tokenize differently, and running every provider tokenizer adds coupling and cost. A conservative estimate is fast and sufficient for selecting history before the request.</p>
+          <p>Selection first applies semantic truncation for retry or edit, then a message-count limit, then walks backward from newest history under the token budget. Actual provider usage is recorded afterward for billing and reporting.</p>
+        </div>
+      </details>
     </section>
 
     <section id="scalability">
