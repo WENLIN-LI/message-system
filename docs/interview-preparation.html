@@ -291,12 +291,19 @@
     <a href="#storage" class="sub">Storage</a>
     <a href="#sandbox" class="sub">Sandbox Lifecycle</a>
     <a href="#daemon" class="sub">Reusable JSONL Daemon</a>
-    <a href="#security">5. Security</a>
-    <a href="#hard-parts">6. Hard Parts</a>
-    <a href="#testing">7. Testing</a>
-    <a href="#stories">8. Interview Stories</a>
-    <a href="#qa">9. Common Q&A</a>
-    <a href="#glossary">10. Glossary</a>
+    <a href="#challenges">5. Technical Challenges</a>
+    <a href="#agent-challenges" class="sub">Code-Agent Challenges</a>
+    <a href="#frontend-challenges" class="sub">Frontend Challenges</a>
+    <a href="#backend-challenges" class="sub">Backend Challenges</a>
+    <a href="#scalability">6. Scalability</a>
+    <a href="#security">7. Security</a>
+    <a href="#testing">8. Testing</a>
+    <a href="#stories">9. Interview Stories</a>
+    <a href="#qa">10. Common Q&amp;A</a>
+    <a href="#comparisons">11. Technology Choices</a>
+    <a href="#metrics">12. Project Metrics</a>
+    <a href="#maturity">13. Engineering Maturity</a>
+    <a href="#glossary">14. Glossary</a>
   </nav>
 
   <main>
@@ -557,77 +564,202 @@ npm run build
       </div>
     </section>
 
-    <section id="security">
-      <h2>5. Security</h2>
+    <section id="challenges">
+      <h2>5. Technical Challenges and Solutions</h2>
       <p>
-        The most important security idea is least privilege: give each component only the access it needs.
+        This section restores all 18 challenges from the original guide. For an interview, explain each one in three steps: what went wrong, what you changed, and why the change is useful.
       </p>
-      <div class="grid">
-        <div class="card">
-          <h4>Sandbox Isolation</h4>
-          <p>Untrusted commands run in E2B, not on the Fly.io Node server.</p>
-        </div>
-        <div class="card">
-          <h4>Room Permissions</h4>
-          <p>The server checks whether a user can join, post, edit, delete, or use code-agent features.</p>
-        </div>
-        <div class="card">
-          <h4>Scoped Tokens</h4>
-          <p>The sandbox receives short-lived tokens for one room and one turn, not long-term database access.</p>
-        </div>
-        <div class="card">
-          <h4>Provider Keys Stay Server-Side</h4>
-          <p>The model gateway lets the sandbox call selected models without exposing real provider keys to the browser.</p>
-        </div>
+
+      <h3 id="agent-challenges">Code-Agent Challenges</h3>
+
+      <div class="card" id="challenge-1">
+        <h3>Challenge 1: Turning a Chat Room into a Shared Execution Environment</h3>
+        <p><strong>Problem:</strong> A coding agent must edit files, install packages, run tests, and start servers. Running those commands inside the production Node process would be dangerous.</p>
+        <p><strong>Solution:</strong> RoomTalk separates the control plane from the execution plane. Node checks permissions and records the turn; one E2B sandbox per room runs the code.</p>
+        <p><strong>Interview takeaway:</strong> The key decision was ownership. Node decides who may do something, while E2B performs the untrusted work.</p>
       </div>
 
-      <h3>How the Agent Reads Room Context Safely</h3>
-      <p>
-        The agent does not receive the whole database. It uses sandbox-facing tools to request limited room history, search results, or messages. The server verifies the turn-scoped token and returns only safe projected data.
-      </p>
+      <div class="card" id="challenge-2">
+        <h3>Challenge 2: Keeping AI Text and Tool Events in the Correct Order</h3>
+        <p><strong>Problem:</strong> An early runner streamed AI text immediately but saved tool calls later. After refresh, the transcript could show a conclusion before the command that produced it.</p>
+        <p><strong>Solution:</strong> The engine emits text, tool-call, and tool-result events in their real execution order. Node assigns a server-side <code>position</code> and starts a new AI text segment after each tool boundary.</p>
+        <p><strong>Why the frontend cannot fix it:</strong> If two text segments were already merged, the browser no longer knows where the tool belongs. Ordering must be captured by the layer that first sees the real sequence.</p>
+      </div>
+
+      <div class="card" id="challenge-3">
+        <h3>Challenge 3: Sharing Room Context with Least Privilege</h3>
+        <p><strong>Problem:</strong> The agent needs earlier room messages, but giving it the full database or a long-lived token would expose too much data.</p>
+        <p><strong>Solution:</strong> Each turn receives a short-lived scoped token. The <code>message-system</code> CLI requests only bounded history, search results, or individual messages through a local broker. The server checks room, client, turn, and mode again before returning safe fields.</p>
+        <p><strong>Interview takeaway:</strong> Model access, room context, and publishing use separate capabilities, so one leaked token cannot unlock everything.</p>
+      </div>
+
+      <div class="card" id="challenge-4">
+        <h3>Challenge 4: Making the Workspace Reviewable Without Bypassing Security</h3>
+        <p><strong>Problem:</strong> Users need to inspect files, diffs, terminals, and previews, but a direct browser-to-E2B connection would bypass Node identity and permission checks.</p>
+        <p><strong>Solution:</strong> Authenticated Socket.IO handlers broker every workspace operation. Files and diffs use bounded snapshots; PTY and preview features use long-lived sessions and delta events; large media uses controlled asset routes.</p>
+        <p><strong>Interview takeaway:</strong> Git refs make diffs repeatable, and line-level review comments become structured context for the next agent turn.</p>
+      </div>
+
+      <div class="card" id="challenge-5">
+        <h3>Challenge 5: Long Tasks, Reusable Daemons, and Sandbox Lifecycle</h3>
+        <p><strong>Problem:</strong> Starting a new runner for every turn is slow. Long tasks, terminals, and dev servers must survive between tool calls, while stale processes must not leave a room stuck as running.</p>
+        <p><strong>Solution:</strong> One reusable daemon processes turns serially in each sandbox. Active work extends the sandbox TTL; idle work returns to a shorter pause timer. Startup cleanup, bounded waits, shutdown hooks, and health checks recover stale state.</p>
+        <p><strong>Upgrade path:</strong> When the pinned sandbox artifact changes, RoomTalk exports the workspace, creates the new sandbox, imports the archive, initializes Git, and swaps the sandbox ID.</p>
+      </div>
+
+      <h3 id="frontend-challenges">Frontend Challenges</h3>
+
+      <div class="card" id="challenge-6">
+        <h3>Challenge 6: Media Viewer Gesture Engine</h3>
+        <p><strong>Problem:</strong> Tap, double-tap, pinch zoom, pan, horizontal paging, and swipe-down dismissal all begin with similar touch events.</p>
+        <p><strong>Solution:</strong> A gesture state machine starts in <code>tap</code>, then locks to one mode after movement passes a threshold. Direction ratios prevent a diagonal swipe from changing modes halfway through.</p>
+        <p><strong>Important details:</strong> Horizontal and vertical intent use slightly different direction thresholds. Double-tap requires two taps within 220 ms and 34 px. Dismissal accepts either enough distance or enough velocity, while pinch zoom keeps the midpoint between the fingers visually fixed.</p>
+        <p><strong>Performance:</strong> Three pending channels hold paging, dismissal, and image transforms. One <code>requestAnimationFrame</code> callback flushes them together instead of writing to the DOM on every touch event. The original implementation also coordinated three visual layers: controls fade first, the backdrop becomes transparent, and the image shrinks.</p>
+      </div>
+
+      <div class="card" id="challenge-7">
+        <h3>Challenge 7: Three-Tier Media Cache</h3>
+        <p><strong>Problem:</strong> Presigned URLs change over time, so normal browser URL caching may download the same private image again.</p>
+        <p><strong>Solution:</strong> Cache by stable <code>assetId</code>: check an in-memory Object URL first, then the browser Cache API, then the network. Concurrent requests share one Promise, preventing several components from downloading the same file at once.</p>
+        <p><strong>Eviction:</strong> An LRU-style policy removes the oldest entries when the cache passes its 300 MB limit and revokes related Object URLs.</p>
+        <p><strong>Extra detail:</strong> Video poster frames are generated with canvas and cached too.</p>
+      </div>
+
+      <div class="card" id="challenge-8">
+        <h3>Challenge 8: Mobile Viewport and Text Input</h3>
+        <p><strong>Problem:</strong> iOS and Android resize pages differently when the keyboard opens. A fixed <code>100vh</code> can hide the input, and pressing Enter during Chinese or Japanese IME composition can send an unfinished message.</p>
+        <p><strong>Solution:</strong> Use the Visual Viewport API to track the usable height and update CSS variables. A ratchet-style baseline changes only when the keyboard is closed or the viewport grows, which avoids treating keyboard shrinkage as a new normal height.</p>
+        <p><strong>IME guard:</strong> Check composition event state, the native event flag, the key code, and a short 80 ms grace period before treating Enter as send.</p>
+      </div>
+
+      <div class="card" id="challenge-9">
+        <h3>Challenge 9: Sticker System</h3>
+        <p><strong>Problem:</strong> The collection contains 2,275 stickers. Loading and rendering every image at once would create too many DOM nodes and network requests.</p>
+        <p><strong>Solution:</strong> Render only the current page and its immediate neighbors, then preload adjacent pages so swiping feels instant. A 350 ms long-press timer opens a preview and suppresses the following click so previewing does not send the sticker.</p>
+        <p><strong>Interview takeaway:</strong> The design balances fast first paint, smooth browsing, and low memory use.</p>
+      </div>
+
+      <div class="card" id="challenge-10">
+        <h3>Challenge 10: Message List UX</h3>
+        <p><strong>Problem:</strong> Waiting for the server before showing a sent message feels slow. Loading older history can also jump the user's scroll position.</p>
+        <p><strong>Solution:</strong> Use a three-phase optimistic state: local pending message, confirmed server message, or failed message that can be retried. When prepending older messages, compare scroll height before and after and add the difference to <code>scrollTop</code>.</p>
+        <p><strong>Auto-scroll:</strong> A <code>ResizeObserver</code> keeps the view attached to the bottom only when the user was already near the bottom, so reading older messages is not interrupted.</p>
+        <p><strong>Interview takeaway:</strong> Realtime correctness and perceived speed are separate problems; the UI must handle both.</p>
+      </div>
+
+      <h3 id="backend-challenges">Backend Challenges</h3>
+
+      <div class="card" id="challenge-11">
+        <h3>Challenge 11: Mobile WebSocket Recovery</h3>
+        <p><strong>Problem:</strong> Mobile browsers suspend background tabs, drop sockets, and sometimes keep an old connection alive briefly. A simple reconnect can miss the room or double-count the same user.</p>
+        <p><strong>Solution:</strong> Persist the intended active room in the browser, re-register identity after reconnect, and rejoin idempotently on reconnect, visibility, online, and page-restore events. Recovery is layered because no single browser event fires reliably on every phone.</p>
+        <p><strong>Duplicate protection:</strong> Presence counts unique <code>clientId</code> values instead of raw socket IDs, so a briefly overlapping old and new socket still represent one member.</p>
+      </div>
+
+      <div class="card" id="challenge-12">
+        <h3>Challenge 12: Redis to PostgreSQL Migration</h3>
+        <p><strong>Problem:</strong> Redis was useful for the first version, but long-term messages, membership, and auth need relational durability and query support.</p>
+        <p><strong>Solution:</strong> Define one durable store contract, implement it in both Redis and PostgreSQL, choose the implementation through <code>PERSISTENCE_STORE</code>, and migrate incrementally with rollback available.</p>
+        <p><strong>Interview takeaway:</strong> The migration changed the storage implementation without forcing socket handlers to know which database was active.</p>
+      </div>
+
+      <div class="card" id="challenge-13">
+        <h3>Challenge 13: Room State Synchronization and Consistency</h3>
+        <p><strong>Problem:</strong> Multiple clients can rename a room, change its password, or update speaking hours while another client still holds an older room object.</p>
+        <p><strong>Solution:</strong> The server returns a complete room object instead of a partial merge. A monotonic <code>room_version</code> tells the client which state is newer, and the write acknowledgement immediately returns the latest object for read-your-write behavior.</p>
+        <p><strong>Why not CRDTs:</strong> RoomTalk has a central online server and mostly server-owned operations. CRDT complexity is not justified unless offline peer editing becomes a real requirement.</p>
+      </div>
+
+      <div class="card" id="challenge-14">
+        <h3>Challenge 14: Multi-Provider AI Abstraction</h3>
+        <p><strong>Problem:</strong> OpenAI, Anthropic, DeepSeek, and OpenRouter use different request formats, stream event shapes, model names, and usage fields.</p>
+        <p><strong>Solution:</strong> Normalize models and provider clients behind one server interface. Convert provider-specific chunks into RoomTalk events, apply provider-specific rate handling in the adapter, and record usage and pricing in one internal format.</p>
+        <p><strong>Interview takeaway:</strong> Provider-neutral persistence allows an interrupted stream to recover consistently even if the selected provider changes.</p>
+      </div>
+
+      <div class="card" id="challenge-15">
+        <h3>Challenge 15: Redis Lua for Atomic Operations</h3>
+        <p><strong>Problem:</strong> A read-modify-write sequence can interleave with another request, causing lost updates, duplicate membership, or incorrect counters.</p>
+        <p><strong>Solution:</strong> Move related Redis checks and writes into Lua scripts. Redis runs each script atomically, so another command cannot interrupt halfway through. Scripts cover operations such as room-version increments, member counts that deduplicate sockets by client ID, and deleting a message while recomputing room activity.</p>
+        <p><strong>Reference counting:</strong> A member remains online until all sockets belonging to that client have left, which handles multiple tabs and reconnect overlap.</p>
+        <p><strong>Junior analogy:</strong> Instead of making several trips to the bank counter, submit one transaction that either completes as a unit or does not happen.</p>
+      </div>
+
+      <div class="card" id="challenge-16">
+        <h3>Challenge 16: Store Contract Tests for Two Implementations</h3>
+        <p><strong>Problem:</strong> RedisStore and PostgresStore can compile against the same interface but still behave differently for edge cases.</p>
+        <p><strong>Solution:</strong> Run the same behavior tests against both stores. The contract checks results, errors, pagination, ordering, and idempotency instead of testing only database-specific code. In-memory Redis and PostgreSQL test doubles simulate Lua and SQL behavior so the same scenarios can run quickly.</p>
+      </div>
+
+      <div class="card" id="challenge-17">
+        <h3>Challenge 17: Message Cache Version Consistency</h3>
+        <p><strong>Problem:</strong> A Redis cache in front of PostgreSQL can return old message pages after an edit, delete, reaction, or new message.</p>
+        <p><strong>Solution:</strong> Use a version-aware read-through cache. <code>CompositeRoomStore</code> invalidates the room cache only after successful writes that can change message results, including edits, deletes, reactions, and streamed AI appends. PostgreSQL remains the source of truth; a cache miss affects speed, not correctness.</p>
+      </div>
+
+      <div class="card" id="challenge-18">
+        <h3>Challenge 18: CJK-Aware AI Context Budgets</h3>
+        <p><strong>Problem:</strong> AI prompts must fit a model's context window. English words and Chinese, Japanese, or Korean characters do not map to tokens in the same way.</p>
+        <p><strong>Solution:</strong> Use a coarse-to-fine selection process: reserve space for the system prompt and answer, estimate each message with language-aware rules, then keep the newest useful history that fits. Mixed CJK and Latin text is estimated separately instead of using one characters-per-token ratio.</p>
+        <p><strong>Interview takeaway:</strong> Estimation protects reliability; usage accounting provides the final cost truth.</p>
+      </div>
     </section>
 
-    <section id="hard-parts">
-      <h2>6. Hard Parts</h2>
+    <section id="scalability">
+      <h2>6. Scalability Discussion</h2>
 
-      <div class="card">
-        <h3>Hard Part 1: Turning Chat into a Coding Workspace</h3>
-        <p>
-          A chat app only needs messages. A coding workspace needs files, commands, terminal sessions, previews, Git state, diffs, and safe execution. RoomTalk solves this by keeping the chat room as the collaboration surface and binding each code-agent room to a sandbox workspace.
-        </p>
+      <h3>Current Bottlenecks</h3>
+      <ul>
+        <li>A single small Fly.io VM has limited CPU and memory for Socket.IO connections and AI stream coordination.</li>
+        <li>Large room fan-out creates more socket broadcasts.</li>
+        <li>AI providers and E2B are external dependencies with their own rate and concurrency limits.</li>
+        <li>Large message histories require pagination and careful frontend rendering.</li>
+      </ul>
+
+      <h3>Horizontal Scaling Plan</h3>
+      <pre><code>Load balancer
+  -> Node instance A
+  -> Node instance B
+  -> Node instance C
+
+All instances share:
+  - Redis adapter for cross-instance Socket.IO events
+  - PostgreSQL for durable data
+  - Redis for presence, sessions, and cache
+  - S3/Tigris for media and artifacts</code></pre>
+      <p><strong>Sticky sessions:</strong> A client should return to the same Socket.IO instance during a connection, especially when long-polling fallback is enabled. The Redis adapter distributes room events across instances but does not replace connection affinity.</p>
+
+      <h3>What Changes at 100,000 Connections?</h3>
+      <ul>
+        <li>Add more Node instances and measure memory per connection.</li>
+        <li>Shard or partition very large rooms and reduce unnecessary broadcasts.</li>
+        <li>Use backpressure and queues for expensive AI or background work.</li>
+        <li>Track connection count, event latency, Redis load, database latency, provider errors, and sandbox startup time.</li>
+      </ul>
+      <div class="warning"><strong>Good interview answer:</strong> Do not claim the current deployment already handles 100,000 users. Explain the current limit, the next bottleneck, and the measurement you would use before redesigning.</div>
+    </section>
+
+    <section id="security">
+      <h2>7. Security</h2>
+      <p>The main idea is least privilege: every request receives only the power needed for that specific action.</p>
+      <div class="grid">
+        <div class="card"><h4>Identity</h4><p>The socket registers a stable client ID. If the account has credentials, the server also verifies its password token or Google identity.</p></div>
+        <div class="card"><h4>Room Authorization</h4><p>The server loads room membership and role, then checks the exact action: join, post, edit, delete, manage members, or use code-agent tools.</p></div>
+        <div class="card"><h4>Sandbox Isolation</h4><p>Untrusted commands run in E2B, not in the Fly.io Node process.</p></div>
+        <div class="card"><h4>Scoped Tokens</h4><p>Context, model, and publishing credentials are short-lived and cannot be exchanged for each other.</p></div>
+        <div class="card"><h4>Private Media</h4><p>Uploads and downloads use short-lived signed URLs after room-access checks.</p></div>
+        <div class="card"><h4>Secret Handling</h4><p>Provider keys remain server-side. Connected Codex credentials are encrypted and injected only for the relevant run.</p></div>
       </div>
 
-      <div class="card">
-        <h3>Hard Part 2: Ordered AI and Tool Events</h3>
-        <p>
-          AI coding agents do not only produce text. They also call tools, run commands, and return results. RoomTalk stores these events in order so users can understand what happened during the agent turn.
-        </p>
-      </div>
+      <h3>Why a UUID Alone Is Not Authentication</h3>
+      <p>A <code>clientId</code> identifies a browser, but anyone who learns it could try to reuse it. For protected accounts, RoomTalk requires a verified auth token before binding that identity to the socket. Authorization checks still run for every room action.</p>
 
-      <div class="card">
-        <h3>Hard Part 3: Long-Running Agent Turns</h3>
-        <p>
-          Agent work can take a long time. Users may want to interrupt it, steer it with more instructions, or approve a risky action. The service tracks active turns and routes control messages to the runner.
-        </p>
-      </div>
-
-      <div class="card">
-        <h3>Hard Part 4: Mobile Recovery</h3>
-        <p>
-          Mobile browsers often suspend tabs and drop sockets. RoomTalk listens for reconnect, visibility, online, and page restore events, then tries to rejoin the active room safely.
-        </p>
-      </div>
-
-      <div class="card">
-        <h3>Hard Part 5: Storage Migration</h3>
-        <p>
-          Moving from Redis-only persistence to PostgreSQL needs careful abstraction. The store interface allows both implementations to share the same behavior while the app gradually moves durable data to PostgreSQL.
-        </p>
-      </div>
+      <h3>Safe Room Context</h3>
+      <p>The agent never receives database credentials. It asks for bounded data through the RoomTalk CLI; the server verifies the turn-scoped capability and removes internal fields before responding.</p>
     </section>
 
     <section id="testing">
-      <h2>7. Testing Strategy</h2>
+      <h2>8. Testing Strategy</h2>
       <p>Explain testing based on risk:</p>
       <table>
         <thead>
@@ -659,7 +791,7 @@ npm run build
     </section>
 
     <section id="stories">
-      <h2>8. Interview Stories</h2>
+      <h2>9. Interview Stories</h2>
 
       <h3>Story 1: Control Plane / Execution Plane</h3>
       <div class="callout">
@@ -691,7 +823,7 @@ npm run build
     </section>
 
     <section id="qa">
-      <h2>9. Common Q&A</h2>
+      <h2>10. Common Q&amp;A</h2>
 
       <details open>
         <summary>Why use Socket.IO instead of plain HTTP?</summary>
@@ -750,15 +882,122 @@ npm run build
       </details>
 
       <details>
+        <summary>What happens when a sandbox pauses or its artifact version changes?</summary>
+        <div class="answer"><p>An idle sandbox can pause with memory preserved and resume later. For a pinned artifact upgrade, RoomTalk exports a bounded workspace archive, imports it into a new sandbox, restores Git state, and then swaps the stored sandbox ID. Published static sites are separate and remain available.</p></div>
+      </details>
+
+      <details>
         <summary>What would you improve next?</summary>
         <div class="answer">
           <p>A good answer is to add a durable workspace revision layer. Today Git state and archive migration preserve continuity, but a product-level immutable revision history would make rollback and auditing stronger.</p>
         </div>
       </details>
+
+      <details>
+        <summary>Why Socket.IO instead of raw WebSocket?</summary>
+        <div class="answer"><p>Socket.IO already provides rooms, acknowledgements, reconnection, fallback transport, and a Redis adapter. Raw WebSocket gives more control but would require RoomTalk to build those features itself.</p></div>
+      </details>
+
+      <details>
+        <summary>Why not use Server-Sent Events for AI streaming?</summary>
+        <div class="answer"><p>SSE works well for one-way server-to-browser text. RoomTalk also needs browser-to-server terminal input, interrupts, steering, approvals, presence, and room events, so one bidirectional Socket.IO channel is simpler.</p></div>
+      </details>
+
+      <details>
+        <summary>Why not use microservices?</summary>
+        <div class="answer"><p>The current scale does not justify the deployment and debugging cost. A modular Node monolith keeps development simple. A separate worker becomes useful only when measured AI or background work becomes a bottleneck.</p></div>
+      </details>
+
+      <details>
+        <summary>How do you guarantee message ordering?</summary>
+        <div class="answer"><p>The server assigns durable positions. Clients display that order instead of trusting device timestamps, which may disagree across phones and laptops.</p></div>
+      </details>
+
+      <details>
+        <summary>How do you reduce database deadlock risk?</summary>
+        <div class="answer"><p>Most message writes are append-only inserts, which avoid competing updates to the same row. Room-setting changes use small atomic updates with a monotonic version and return the latest row. Transactions stay short, and retry is available for a real serialization or deadlock failure.</p></div>
+      </details>
+
+      <details>
+        <summary>How do you handle large message histories?</summary>
+        <div class="answer"><p>The store reads pages instead of the whole room. PostgreSQL queries durable history, Redis may cache recent pages, and the client preserves scroll position while older pages are prepended.</p></div>
+      </details>
+
+      <details>
+        <summary>What was a difficult production-style bug?</summary>
+        <div class="answer"><p>Mobile background recovery could briefly leave two sockets for one browser and double the member count. Presence was corrected by counting unique client IDs and making room rejoin idempotent.</p></div>
+      </details>
+    </section>
+
+    <section id="comparisons">
+      <h2>11. Technology Choices</h2>
+
+      <h3>Realtime Communication</h3>
+      <table>
+        <thead><tr><th>Option</th><th>Direction</th><th>Strength</th><th>RoomTalk Decision</th></tr></thead>
+        <tbody>
+          <tr><td>HTTP polling</td><td>Request/response</td><td>Simple</td><td>Too much delay and repeated traffic for chat.</td></tr>
+          <tr><td>SSE</td><td>Server to client</td><td>Good streaming</td><td>Not enough for terminal input and realtime controls.</td></tr>
+          <tr><td>Raw WebSocket</td><td>Two-way</td><td>Low-level control</td><td>Would require custom rooms, retries, and acknowledgements.</td></tr>
+          <tr><td><strong>Socket.IO</strong></td><td>Two-way</td><td>Rooms, ack, reconnect, Redis adapter</td><td>Best fit for the current product.</td></tr>
+        </tbody>
+      </table>
+
+      <h3>Database Roles</h3>
+      <table>
+        <thead><tr><th>Database</th><th>Best At</th><th>RoomTalk Usage</th></tr></thead>
+        <tbody>
+          <tr><td>Redis</td><td>Fast key/value data and expiration</td><td>Presence, sessions, realtime counts, and cache.</td></tr>
+          <tr><td>PostgreSQL</td><td>Durable relational data and SQL</td><td>Rooms, messages, members, media metadata, and auth.</td></tr>
+          <tr><td>MongoDB</td><td>Flexible documents</td><td>Not used because RoomTalk benefits from relational constraints and SQL.</td></tr>
+        </tbody>
+      </table>
+
+      <h3>Deployment Options</h3>
+      <table>
+        <thead><tr><th>Platform</th><th>Tradeoff</th><th>When It Fits</th></tr></thead>
+        <tbody>
+          <tr><td><strong>Fly.io</strong></td><td>Low operational work with good WebSocket support</td><td>Current RoomTalk stage.</td></tr>
+          <tr><td>AWS ECS Fargate</td><td>More infrastructure control and setup</td><td>Larger production workloads with AWS integration.</td></tr>
+          <tr><td>AWS EKS</td><td>Highest flexibility and operational complexity</td><td>Large teams already operating Kubernetes.</td></tr>
+          <tr><td>Vercel</td><td>Excellent frontend hosting, limited long-lived server connections</td><td>Frontend or request-based applications.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="metrics">
+      <h2>12. Project Metrics</h2>
+      <p>Use concrete numbers only when you can explain where they came from. The original guide highlighted these project facts:</p>
+      <table>
+        <thead><tr><th>Metric</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td>3 agent backends</td><td>Coco, Codex compatibility, and Codex app-server; new Codex work targets app-server.</td></tr>
+          <tr><td>4 permission modes</td><td>Different room-access policies supported by the product.</td></tr>
+          <tr><td>5 languages</td><td>English, Chinese, Hindi, Japanese, and Korean.</td></tr>
+          <tr><td>170+ test/spec files</td><td>Coverage across server, client, browser flows, persistence, and sandbox behavior.</td></tr>
+          <tr><td>2 persistence modes</td><td>Redis or PostgreSQL as the durable store, selected by configuration.</td></tr>
+          <tr><td>5-minute default idle pause</td><td>Inactive E2B sandboxes pause to control cost.</td></tr>
+          <tr><td>100 MB artifact version cap</td><td>A bound on each published static artifact version.</td></tr>
+          <tr><td>1 shared sandbox per room</td><td>Room members and the agent work against the same workspace.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="maturity">
+      <h2>13. Engineering Maturity</h2>
+      <div class="grid">
+        <div class="card"><h4>Incremental Migration</h4><p>Redis to PostgreSQL used an interface, a configuration switch, and rollback instead of one irreversible cutover.</p></div>
+        <div class="card"><h4>Safety Guards</h4><p>Persistence smoke tests accept only clearly named test or E2E databases, reducing the chance of touching production.</p></div>
+        <div class="card"><h4>Docs as Code</h4><p>Configuration and architecture live beside the code and change through review.</p></div>
+        <div class="card"><h4>CI Guardrails</h4><p>Deployment checks required configuration before release instead of waiting for a runtime crash.</p></div>
+        <div class="card"><h4>Idempotent Operations</h4><p>Retries and migrations are designed so repeating the same operation does not create duplicate data.</p></div>
+        <div class="card"><h4>Two-Layer Release Contract</h4><p>The Fly app and pinned E2B artifact deploy separately. Runner changes require a new artifact version, template build, smoke test, and matching production pins.</p></div>
+        <div class="card"><h4>Honest Boundaries</h4><p>Git and archive migration preserve workspace continuity, but they are not yet a complete immutable revision and rollback product.</p></div>
+      </div>
     </section>
 
     <section id="glossary">
-      <h2>10. Glossary</h2>
+      <h2>14. Glossary</h2>
       <table>
         <thead>
           <tr><th>Term</th><th>Simple Meaning</th></tr>
@@ -803,6 +1042,10 @@ npm run build
           <tr>
             <td>Artifact</td>
             <td>A published static output, such as a generated website or built frontend.</td>
+          </tr>
+          <tr>
+            <td>AI Turn</td>
+            <td>One complete AI task, from the user's request through text, tool calls, results, usage, and final completion or interruption.</td>
           </tr>
         </tbody>
       </table>
